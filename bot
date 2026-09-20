@@ -69,7 +69,7 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] STANDALONE CHECKER BOT ONLINE")
+print(Fore.RED + " [KUDASAI] RESTORED FULL GUI BOT ONLINE")
 print(Fore.RED + "==================================================\n")
 
 # --- NATIVE CHECKER ENGINE ---
@@ -225,34 +225,83 @@ async def process_accounts_with_native_engine(account_lines, chat_id, context: C
 def get_main_menu(user_id):
     is_admin = user_id in ADMIN_IDS or db_query("SELECT is_admin FROM users WHERE user_id=?", (user_id,), "one")
     if is_admin and type(is_admin) is tuple: is_admin = is_admin[0]
+
     keyboard = [
         [InlineKeyboardButton("🚀 Start Checker", callback_data="start_checker"), InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="stats")]
+        [InlineKeyboardButton("🌐 Set Proxy", callback_data="set_proxy"), InlineKeyboardButton("📊 Statistics", callback_data="stats")]
     ]
-    if is_admin: keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+    if is_admin:
+        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_panel_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("👥 View Users", callback_data="adm_view_users"), InlineKeyboardButton("📊 View Stats", callback_data="adm_view_stats")],
+        [InlineKeyboardButton("🔑 1H", callback_data="gen_1h"), InlineKeyboardButton("🔑 3H", callback_data="gen_3h"), InlineKeyboardButton("🔑 7H", callback_data="gen_7h"), InlineKeyboardButton("🔑 10H", callback_data="gen_10h")],
+        [InlineKeyboardButton("🗑️ Delete All Keys", callback_data="adm_del_all_keys"), InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 async def set_bot_commands(application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Open dashboard"),
-        BotCommand("redeem", "Redeem key (/redeem <KEY>)"),
-        BotCommand("admin", "Admin panel")
-    ])
+    commands = [
+        BotCommand("start", "Open Kudasai main menu & dashboard"),
+        BotCommand("redeem", "Redeem a premium subscription key (Usage: /redeem <KEY>)"),
+        BotCommand("help", "Display help guide and instructions"),
+        BotCommand("stats", "Check live system checking metrics"),
+        BotCommand("admin", "Open Admin Control Panel (Admins Only)")
+    ]
+    await application.bot.set_my_commands(commands)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_query("INSERT OR IGNORE INTO users (user_id, username, expiry) VALUES (?, ?, ?)", (user.id, user.username or "Unknown", datetime.now().isoformat()))
+    
     user_data = db_query("SELECT is_banned, expiry FROM users WHERE user_id=?", (user.id,), "one")
-    if user_data and user_data[0] == 1:
-        if update.message: await update.message.reply_text("❌ Banned.")
+    if user_data and len(user_data) >= 2 and user_data[0] == 1:
+        if update.message: await update.message.reply_text("❌ You are banned from using this bot.")
         return
-    expiry_dt = datetime.fromisoformat(user_data[1]) if user_data and user_data[1] else datetime.now()
-    has_access = expiry_dt > datetime.now() or user.id in ADMIN_IDS
-    access_status = f"✅ Active until {expiry_dt.strftime('%m-%d %H:%M')}" if has_access else "❌ No Active Key"
 
-    gui_text = f"✨ **KUDASAI XBOX CHECKER** ✨\n\n🔒 Access: {access_status}\n\nUse buttons below:"
-    if update.message: await update.message.reply_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
-    elif update.callback_query: await update.callback_query.message.edit_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
+    expiry_str = user_data[1] if user_data and len(user_data) >= 2 else datetime.now().isoformat()
+    expiry_dt = datetime.fromisoformat(expiry_str)
+    has_access = expiry_dt > datetime.now() or user.id in ADMIN_IDS
+    access_status = f"✅ Active until {expiry_dt.strftime('%m-%d %H:%M')}" if has_access else "❌ No Active Key | Use /redeem"
+
+    gui_text = (
+        "✨ **Welcome to** ✨ **KUDASAI XBOX CHECKER!**\n"
+        "╔═══════════════════════════════════════\n"
+        f"║ 🕹️ Xbox Account Checker\n"
+        f"║ ℹ️ Version: v2.0\n"
+        f"║ 👑 Owner: {OWNER_HANDLE}\n"
+        "╠═══════════════════════════════════════\n"
+        f"║ 🔒 Access: {access_status}\n"
+        f"║ 📊 Total Checks: {bot_stats['total_processed']}\n"
+        f"║ 🎯 Hits Found: {bot_stats['successful']}\n"
+        f"║ 🌐 Proxy: None | 0 loaded\n"
+        "╚═══════════════════════════════════════\n\n"
+        "Use the buttons below to get started!"
+    )
+
+    if update.message:
+        await update.message.reply_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
+    elif update.callback_query:
+        await update.callback_query.message.edit_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 **Kudasai Help Menu**\n\n• `/start` - Main menu\n• `/redeem <KEY>` - Unlock access", parse_mode="Markdown")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total_p = bot_stats["total_processed"]
+    success = bot_stats["successful"]
+    failed = bot_stats["failed"]
+    rate = f"{(success / total_p * 100):.1f}%" if total_p > 0 else "0.0%"
+    await update.message.reply_text(f"📈 **Statistics:**\n• Processed: {total_p}\n• Success: {success}\n• Failed: {failed}", parse_mode="Markdown")
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Access Denied.")
+        return
+    await update.message.reply_text("⚙️ **[KUDASAI] ADMIN CONTROL PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -260,19 +309,47 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    if data == "main_menu": await start_command(update, context)
+    if data == "main_menu":
+        await start_command(update, context)
     elif data == "start_checker":
         user_data = db_query("SELECT expiry FROM users WHERE user_id=?", (user_id,), "one")
         has_access = (user_data and user_data[0] and datetime.fromisoformat(user_data[0]) > datetime.now()) or user_id in ADMIN_IDS
         if not has_access:
-            await query.message.reply_text("❌ Access Denied! Redeem a key first using /redeem.")
+            await query.message.reply_text("❌ Access Denied! Please redeem a key first using /redeem.")
             return
-        await query.message.reply_text("📥 Send your `.txt` account file or paste your `email:password` list now.")
-    elif data == "redeem_prompt": await query.message.reply_text("🔑 Send your key: `/redeem <KEY>`", parse_mode="Markdown")
-    elif data == "stats": await query.message.reply_text(f"📈 Total Processed: {bot_stats['total_processed']}")
+        await query.message.reply_text("📥 **Send your accounts:** Upload your `.txt` account file now.")
+    elif data == "redeem_prompt":
+        await query.message.reply_text("🔑 Send your key using command: `/redeem <KEY>`")
+    elif data == "set_proxy":
+        await query.message.reply_text("🌐 Send your proxy in `ip:port` format.")
+    elif data == "stats":
+        total_p = bot_stats["total_processed"]
+        success = bot_stats["successful"]
+        await query.message.reply_text(f"📈 **Statistics:**\n• Processed: {total_p}\n• Hits: {success}", parse_mode="Markdown")
     elif data == "admin_panel":
         if user_id not in ADMIN_IDS: return
-        await query.message.edit_text("⚙️ **ADMIN PANEL**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
+        await query.message.edit_text("⚙️ **[KUDASAI] ADMIN CONTROL PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
+    elif data.startswith("gen_"):
+        if user_id not in ADMIN_IDS: return
+        hrs = {"gen_1h": 1, "gen_3h": 3, "gen_7h": 7, "gen_10h": 10}.get(data, 1)
+        key_str = "KUDASAI-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (key_str, hrs))
+        await query.message.reply_text(f"🔑 **Generated {hrs}H Key:**\n`{key_str}`", parse_mode="Markdown")
+    elif data == "adm_view_users":
+        if user_id not in ADMIN_IDS: return
+        users = db_query("SELECT user_id, username, expiry FROM users", fetch="all")
+        msg = "📋 **Users:**\n\n"
+        for u in users[:25]: msg += f"• `{u[0]}` | @{u[1]}\n"
+        await query.message.reply_text(msg, parse_mode="Markdown")
+    elif data == "adm_view_stats":
+        if user_id not in ADMIN_IDS: return
+        total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
+        keys_count = len(db_query("SELECT key FROM keys WHERE is_redeemed=0", fetch="all"))
+        await query.message.reply_text(f"📊 **Metrics:**\n• Users: {total_users}\n• Unused Keys: {keys_count}")
+    elif data == "adm_del_all_keys":
+        if user_id not in ADMIN_IDS: return
+        db_query("DELETE FROM keys")
+        await query.message.reply_text("🧹 All keys wiped.")
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -282,30 +359,36 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     key_input = args[0].strip()
     key_data = db_query("SELECT duration_hours, is_redeemed FROM keys WHERE key=?", (key_input,), "one")
+    
     if not key_data or key_data[1] == 1:
-        await update.message.reply_text("❌ Invalid or used key.")
+        await update.message.reply_text("❌ Invalid or already redeemed key.")
         return
+    
+    hours = key_data[0]
     db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE key=?", (user.id, key_input))
+    
     current_expiry = db_query("SELECT expiry FROM users WHERE user_id=?", (user.id,), "one")
     base_time = datetime.now()
     if current_expiry and current_expiry[0]:
         parsed_exp = datetime.fromisoformat(current_expiry[0])
         if parsed_exp > base_time: base_time = parsed_exp
-    new_expiry = base_time + timedelta(hours=key_data[0])
+            
+    new_expiry = base_time + timedelta(hours=hours)
     db_query("UPDATE users SET expiry=? WHERE user_id=?", (new_expiry.isoformat(), user.id))
-    await update.message.reply_text(f"✅ Success! Active until: {new_expiry.strftime('%Y-%m-%d %H:%M')}")
+    
+    await update.message.reply_text(f"✅ **Key Redeemed!**\nAccess until: {new_expiry.strftime('%Y-%m-%d %H:%M')}", parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_data = db_query("SELECT is_banned FROM users WHERE user_id=?", (user.id,), "one")
-    if user_data and user_data[0] == 1: return
+    if user_data and len(user_data) > 0 and user_data[0] == 1: return
 
     if update.message.document:
         doc = update.message.document
         file_obj = await context.bot.get_file(doc.file_id)
         byte_array = await file_obj.download_as_bytearray()
         try: file_content = byte_array.decode("utf-8", errors="ignore")
-        except: file_content = str(byte_array)
+        except Exception: file_content = str(byte_array)
         await process_accounts_with_native_engine(file_content.splitlines(), update.effective_chat.id, context)
         return
 
@@ -315,13 +398,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("redeem", redeem_command))
-    app.add_handler(CommandHandler("admin", lambda u, c: c.bot.send_message(u.effective_chat.id, "Admin Panel", reply_markup=get_main_menu(u.effective_user.id))))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
-    print(Fore.GREEN + "[+] Kudasai Self-Contained Bot is online...")
+
+    print(Fore.GREEN + "[+] Kudasai Restored Full GUI Bot is online...")
     app.run_polling()
 
 if __name__ == "__main__":
