@@ -9,8 +9,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotComm
 from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 from colorama import init, Fore
 
-# Import your native checking function directly from xbox_checker.py
-from xbox_checker import check_xbox_account
+# Import your native checker from xbox_checker_2.py
+from xbox_checker_2 import check_xbox_account
 
 init(autoreset=True)
 
@@ -71,7 +71,7 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] NATIVE ENGINE CHECKER BOT ONLINE")
+print(Fore.RED + " [KUDASAI] LIVE ENGINE CHECKER BOT ONLINE")
 print(Fore.RED + "==================================================\n")
 
 def log_to_file(filename, content):
@@ -111,7 +111,7 @@ async def process_accounts_with_native_engine(account_lines, chat_id, context: C
 
     total = len(valid_accounts)
     if total == 0:
-        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your input file.")
+        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your file.")
         return
 
     status_msg = await context.bot.send_message(
@@ -143,8 +143,8 @@ async def process_accounts_with_native_engine(account_lines, chat_id, context: C
         except Exception:
             pass
 
-        # Execute your checking function asynchronously or via thread executor to avoid blocking the bot loop
         try:
+            # Run checker function in a separate thread to keep Telegram responsive
             result = await asyncio.to_thread(check_xbox_account, email, password)
             status = result.get('status')
 
@@ -462,13 +462,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_content = str(byte_array)
             
         lines = file_content.splitlines()
-        await process_accounts_with_xbox_api(lines, update.effective_chat.id, context)
+        await process_accounts_with_native_engine(lines, update.effective_chat.id, context)
         return
 
     text = update.message.text
     if text and not text.startswith("/"):
         lines = text.strip().splitlines()
-        await process_accounts_with_xbox_api(lines, update.effective_chat.id, context)
+        await process_accounts_with_native_engine(lines, update.effective_chat.id, context)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
@@ -482,7 +482,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    print(Fore.GREEN + "[+] Kudasai Xbox API Checker Bot is online...")
+    print(Fore.GREEN + "[+] Kudasai Native Engine Checker Bot is online...")
     app.run_polling()
 
 main()
