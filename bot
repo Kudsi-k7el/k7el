@@ -15,15 +15,18 @@ init(autoreset=True)
 TELEGRAM_BOT_TOKEN = "8658943714:AAEFCKM5eEzjrQSI4rUDH4dndRRQKmh36c4"
 OWNER_HANDLE = "@kudsoo"
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
-OUTPUT_DIR = "results_output"
-TOOL_RESULTS_FOLDER = "xbox_results"  # Folder created by your tool
+
+# Absolute paths based on where bot.py is located
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "results_output")
+TOOL_RESULTS_FOLDER = os.path.join(BASE_DIR, "xbox_results")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TOOL_RESULTS_FOLDER, exist_ok=True)
 
 # DATABASE INITIALIZATION
 def init_db():
-    conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+    conn = sqlite3.connect(os.path.join(BASE_DIR, "bot_database.db"), check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -48,7 +51,7 @@ def init_db():
 init_db()
 
 def db_query(query, params=(), fetch=None):
-    conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+    conn = sqlite3.connect(os.path.join(BASE_DIR, "bot_database.db"), check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute(query, params)
     result = None
@@ -69,36 +72,42 @@ bot_stats = {
 }
 
 print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] XBOX_RESULTS FOLDER CAPTURE ONLINE")
+print(Fore.RED + " [KUDASAI] ABSOLUTE PATH CHECKER ENGINE ONLINE")
 print(Fore.RED + "==================================================\n")
 
 async def run_tool_checker(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await context.bot.send_message(chat_id=chat_id, text="⚡ **[KUDASAI]** Preparing encrypted tool execution...")
+    status_msg = await context.bot.send_message(chat_id=chat_id, text="⚡ **[KUDASAI]** Initializing encrypted tool execution...")
 
-    # Save incoming accounts into 'accounts.txt' (standard input format for tools)
-    with open("accounts.txt", "w", encoding="utf-8") as f:
+    # Save accounts explicitly to the exact folder where .ninjapy lives
+    accounts_file_path = os.path.join(BASE_DIR, "accounts.txt")
+    with open(accounts_file_path, "w", encoding="utf-8") as f:
         for line in account_lines:
             f.write(line.strip() + "\n")
 
-    await status_msg.edit_text("⚡ **[KUDASAI]** Running tool engine in background... Please wait.")
+    await status_msg.edit_text("⚡ **[KUDASAI]** Tool is checking accounts in the background...")
 
-    # Execute the obfuscated tool
+    # Execute tool with absolute path context
     try:
+        ninja_path = os.path.join(BASE_DIR, ".ninjapy")
         process = subprocess.Popen(
-            ["python3", ".ninjapy"],
+            ["python3", ninja_path],
+            cwd=BASE_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
-        process.communicate(timeout=300) # 5 min timeout max
+        stdout_val, stderr_val = process.communicate(timeout=600) # 10 min timeout
+        print(Fore.CYAN + f"[DEBUG] Tool stdout: {stdout_val}")
+        if stderr_val:
+            print(Fore.YELLOW + f"[DEBUG] Tool stderr: {stderr_val}")
     except Exception as e:
-        print(Fore.RED + f"[-] Tool execution error: {str(e)}")
+        print(Fore.RED + f"[-] Execution exception: {str(e)}")
 
-    await status_msg.edit_text("🎯 **[KUDASAI]** Execution finished. Checking `xbox_results` folder...")
+    await status_msg.edit_text("🎯 **[KUDASAI]** Checking finished! Collecting hits from `xbox_results`...")
 
     sent_any = False
 
-    # Check inside the xbox_results folder for any output files
+    # Check xbox_results folder for hits
     if os.path.exists(TOOL_RESULTS_FOLDER):
         for filename in os.listdir(TOOL_RESULTS_FOLDER):
             file_path = os.path.join(TOOL_RESULTS_FOLDER, filename)
@@ -107,32 +116,33 @@ async def run_tool_checker(account_lines, chat_id, context: ContextTypes.DEFAULT
                     await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Hit Result: {filename}")
                 sent_any = True
                 try:
-                    os.remove(file_path) # Clean up file after sending
+                    os.remove(file_path)
                 except Exception:
                     pass
 
-    # Fallback check in root directory just in case
+    # Fallback check in root directory
     for fallback in ["results.txt", "2fa.txt", "errors.txt", "hits.txt", "valid.txt", "checked.txt"]:
-        if os.path.exists(fallback) and os.path.getsize(fallback) > 0:
-            with open(fallback, "rb") as f:
+        fb_path = os.path.join(BASE_DIR, fallback)
+        if os.path.exists(fb_path) and os.path.getsize(fb_path) > 0:
+            with open(fb_path, "rb") as f:
                 await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Output: {fallback}")
             sent_any = True
             try:
-                os.remove(fallback)
+                os.remove(fb_path)
             except Exception:
                 pass
 
-    # Cleanup accounts input file
-    if os.path.exists("accounts.txt"):
+    # Cleanup accounts file
+    if os.path.exists(accounts_file_path):
         try:
-            os.remove("accounts.txt")
+            os.remove(accounts_file_path)
         except Exception:
             pass
 
     if not sent_any:
         await context.bot.send_message(
             chat_id=chat_id, 
-            text="ℹ️ Tool executed successfully, but the `xbox_results` folder was empty or no files were detected inside it."
+            text="ℹ️ Tool finished running, but no result files were found in `xbox_results`. Please verify if your tool requires a specific command-line argument (like file names) when run."
         )
 
 def get_main_menu(user_id):
@@ -420,7 +430,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    print(Fore.GREEN + "[+] Kudasai xbox_results Capture Bot is online...")
+    print(Fore.GREEN + "[+] Kudasai Tool-Integrated Bot is online and running...")
     app.run_polling()
 
-main()
+if __name__ == "__main__":
+    main()
