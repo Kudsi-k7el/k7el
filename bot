@@ -37,6 +37,9 @@ GROUP_LINK = "https://t.me/kudasaiisimpressed"
 
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
 
+# Concurrency Queue Limiter (e.g., max 3 simultaneous checks to prevent rate limits)
+CHECK_SEMAPHORE = asyncio.Semaphore(3)
+
 # ==================== DATABASE SETUP ====================
 DB_NAME = "netflix_bot.db"
 
@@ -52,8 +55,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            checks_count INTEGER DEFAULT 0,
-            waiting_for_broadcast INTEGER DEFAULT 0
+            checks_count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -375,7 +377,7 @@ def get_join_menu():
 async def set_bot_commands(application):
     commands = [
         BotCommand("start", "Open main menu"),
-        BotCommand("stats", "Check your usage stats"),
+        BotCommand("stats", "Check total bot statistics"),
         BotCommand("admin", "Open admin panel (Admin only)")
     ]
     await application.bot.set_my_commands(commands)
@@ -447,19 +449,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "check_status":
         user_data = db_query("SELECT checks_count FROM users WHERE user_id=?", (user_id,), "one")
         total = user_data["checks_count"] if user_data else 0
+        total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
 
         await query.message.edit_text(
             f"📊 **Your Account Status:**\n\n"
             f"• Telegram ID: `{user_id}`\n"
-            f"• Access: Unlimited (Free)\n"
-            f"• Total Checked: `{total}`",
+            f"• Total Checks Performed: `{total}`\n"
+            f"• Total Bot Users: `{total_users} users`\n"
+            f"• Queue Status: Active (Admin Bypass Enabled)",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "guide":
         guide_msg = (
             "📖 **User Guide:**\n\n"
             "1. Click **Check Netflix Cookie** and paste your Netscape cookies.\n"
-            "2. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
+            "2. If the server is busy, your request will enter a seamless queue.\n"
+            "3. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
             f"👑 Owner: {OWNER_HANDLE}"
         )
         await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
@@ -470,7 +475,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"• Total Registered Users: `{users_count}`\n"
-            f"• Status: Watermark added & group link active",
+            f"• Active Semaphore Limit: `3 concurrent checks`\n"
+            f"• Status: Queue enabled, Admins bypass queue.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
@@ -492,7 +498,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status_msg = await update.message.reply_text("⏳ <i>Processing cookies and generating tokens...</i>", parse_mode="HTML")
+    is_admin = user.id in ADMIN_IDS
+    status_msg = await update.message.reply_text("⏳ <i>Processing cookies in queue...</i>", parse_mode="HTML")
 
     try:
         cookies = load_cookies(text)
@@ -500,7 +507,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ <b>Error:</b> Could not detect valid Netflix cookies (`NetflixId` / `SecureNetflixId`).", parse_mode="HTML")
             return
 
-        acc = await asyncio.to_thread(check_account, cookies, 20)
+        # Queue handling: Admins skip the semaphore limit completely!
+        if is_admin:
+            acc = await asyncio.to_thread(check_account, cookies, 20)
+        else:
+            async with CHECK_SEMAPHORE:
+                await status_msg.edit_text("🔄 <i>Your request has left the queue and is now checking...</i>", parse_mode="HTML")
+                acc = await asyncio.to_thread(check_account, cookies, 20)
+
         if not acc:
             await status_msg.edit_text("❌ <b>Error:</b> Account is dead, logged out, or cookies are expired/invalid.", parse_mode="HTML")
             return
@@ -555,12 +569,12 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, "Bot status: Online & Watermarked!")))
+    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"📊 Total Bot Users: {len(db_query('SELECT user_id FROM users', fetch='all'))}")))
     app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Keyless Netflix Bot is online with watermark!")
+    print("[+] Kudasai Keyless Netflix Bot is online with Queue & User Tracking!")
     app.run_polling()
 
 if __name__ == "__main__":
