@@ -8,7 +8,7 @@ import string
 import asyncio
 import urllib3
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -28,7 +28,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 TELEGRAM_BOT_TOKEN = "8597687291:AAGoa2PQL6glLjyT2Tb-qH8MXRm9h_8jutc"
 OWNER_HANDLE = "@kudsoo"
 
-# MANDATORY CHATS TO JOIN
 REQUIRED_CHANNEL = "@kudsiontop"
 CHANNEL_LINK = "https://t.me/kudsiontop"
 
@@ -37,7 +36,7 @@ GROUP_LINK = "https://t.me/kudaisimpressed"
 
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
 
-# ==================== DATABASE SETUP (SINGLE CONNECTION THREAD) ====================
+# ==================== DATABASE SETUP ====================
 DB_NAME = "netflix_bot.db"
 
 def get_db():
@@ -53,20 +52,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             checks_count INTEGER DEFAULT 0,
-            is_premium INTEGER DEFAULT 0,
-            premium_expires TEXT,
-            waiting_for_key INTEGER DEFAULT 0,
             waiting_for_broadcast INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS keys (
-            code TEXT PRIMARY KEY,
-            duration_text TEXT,
-            duration_seconds INTEGER,
-            is_redeemed INTEGER DEFAULT 0,
-            redeemed_by INTEGER,
-            created_at TEXT
         )
     """)
     conn.commit()
@@ -92,46 +78,6 @@ def db_query(query, params=(), fetch=None):
         return None
     finally:
         conn.close()
-
-def parse_duration(dur_str):
-    dur_str = dur_str.strip().lower()
-    if dur_str in ["lifetime", "life", "inf"]:
-        return "Lifetime", 9999999999
-    
-    match = re.match(r"^(\d+)([mhdy])$", dur_str)
-    if not match:
-        return None, None
-    
-    val, unit = int(match.group(1)), match.group(2)
-    if unit == "m":
-        return f"{val} Minute(s)", val * 60
-    elif unit == "h":
-        return f"{val} Hour(s)", val * 3600
-    elif unit == "d":
-        return f"{val} Day(s)", val * 86400
-    elif unit == "y":
-        return f"{val} Year(s)", val * 31536000
-    return None, None
-
-def check_user_premium(user_id):
-    if user_id in ADMIN_IDS:
-        return True
-    user = db_query("SELECT is_premium, premium_expires FROM users WHERE user_id=?", (user_id,), "one")
-    if not user:
-        return False
-    is_prem, expires = user["is_premium"], user["premium_expires"]
-    if not is_prem:
-        return False
-    if expires == "Lifetime":
-        return True
-    try:
-        exp_dt = datetime.fromisoformat(expires)
-        if datetime.now() > exp_dt:
-            db_query("UPDATE users SET is_premium=0, premium_expires=NULL WHERE user_id=?", (user_id,))
-            return False
-        return True
-    except Exception:
-        return False
 
 async def check_memberships(bot, user_id):
     if user_id in ADMIN_IDS:
@@ -411,7 +357,7 @@ def check_account(cookies: dict, timeout=20):
 def get_main_menu(user_id):
     is_admin = user_id in ADMIN_IDS
     keyboard = [
-        [InlineKeyboardButton("🍪 Check Netflix Cookie", callback_data="check_prompt"), InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt")],
+        [InlineKeyboardButton("🍪 Check Netflix Cookie", callback_data="check_prompt")],
         [InlineKeyboardButton("📊 My Account Status", callback_data="check_status"), InlineKeyboardButton("📖 Guide", callback_data="guide")]
     ]
     if is_admin:
@@ -428,8 +374,7 @@ def get_join_menu():
 async def set_bot_commands(application):
     commands = [
         BotCommand("start", "Open main menu"),
-        BotCommand("stats", "Check your membership status"),
-        BotCommand("redeem", "Redeem key (/redeem <key>)"),
+        BotCommand("stats", "Check your usage stats"),
         BotCommand("admin", "Open admin panel (Admin only)")
     ]
     await application.bot.set_my_commands(commands)
@@ -437,7 +382,6 @@ async def set_bot_commands(application):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
-    db_query("UPDATE users SET waiting_for_key=0 WHERE user_id=?", (user.id,))
 
     is_ch, is_gp = await check_memberships(context.bot, user.id)
     if not is_ch or not is_gp:
@@ -472,7 +416,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, query.from_user.username or "Unknown"))
-    db_query("UPDATE users SET waiting_for_key=0 WHERE user_id=?", (user_id,))
 
     if data == "check_membership":
         is_ch, is_gp = await check_memberships(context.bot, user_id)
@@ -495,116 +438,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "main_menu":
         await start_command(update, context)
     elif data == "check_prompt":
-        is_prem = check_user_premium(user_id)
-        if not is_prem and user_id not in ADMIN_IDS:
-            await query.message.edit_text(
-                "❌ **Subscription Required!**\n\n"
-                "Your premium access has expired or is inactive. Please redeem a time-based access key to use the checker.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔑 Redeem Key", callback_data="redeem_prompt"), InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
-            return
-
         await query.message.edit_text(
             "🍪 **Send Netflix Cookies**\n\n"
             "Please paste your Netscape cookies or cookie text directly in the chat now:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]]))
-    elif data == "redeem_prompt":
-        db_query("UPDATE users SET waiting_for_key=1 WHERE user_id=?", (user_id,))
-        await query.message.edit_text(
-            "🔑 **Enter your Access Key:**\n\n"
-            "Please type and send your key in the chat now:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]]))
     elif data == "check_status":
-        is_prem = check_user_premium(user_id)
-        user_data = db_query("SELECT checks_count, premium_expires FROM users WHERE user_id=?", (user_id,), "one")
+        user_data = db_query("SELECT checks_count FROM users WHERE user_id=?", (user_id,), "one")
         total = user_data["checks_count"] if user_data else 0
-        expires = user_data["premium_expires"] if user_data else "None"
-        
-        status_text = "🟢 Active Premium" if is_prem else "🔴 Expired / Free"
-        if user_id in ADMIN_IDS:
-            status_text = "👑 Administrator (Lifetime)"
-            expires = "Never"
 
         await query.message.edit_text(
             f"📊 **Your Account Status:**\n\n"
             f"• Telegram ID: `{user_id}`\n"
-            f"• Membership: `{status_text}`\n"
-            f"• Expires: `{expires}`\n"
+            f"• Access: Unlimited (Free)\n"
             f"• Total Checked: `{total}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "guide":
         guide_msg = (
             "📖 **User Guide:**\n\n"
-            "1. Click **Redeem Key** to activate your subscription duration.\n"
-            "2. Click **Check Netflix Cookie** and paste your Netscape cookies.\n"
-            "3. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
+            "1. Click **Check Netflix Cookie** and paste your Netscape cookies.\n"
+            "2. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
             f"👑 Owner: {OWNER_HANDLE}"
         )
         await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "admin_panel":
         if user_id not in ADMIN_IDS: return
         users_count = len(db_query("SELECT user_id FROM users", fetch="all"))
-        active_keys = len(db_query("SELECT code FROM keys WHERE is_redeemed=0", fetch="all"))
-        redeemed_keys = len(db_query("SELECT code FROM keys WHERE is_redeemed=1", fetch="all"))
         
         await query.message.edit_text(
             f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"• Total Registered Users: `{users_count}`\n"
-            f"• Unused Keys: `{active_keys}`\n"
-            f"• Redeemed Keys: `{redeemed_keys}`\n\n"
-            f"Commands:\n"
-            f"• `/addkey <duration> [custom_code]`\n"
-            f"  (e.g., `/addkey 7d` or `/addkey lifetime mykey`)",
+            f"• Status: Key system permanently removed (Free access)",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
-
-async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    args = context.args
-    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
-
-    if not args:
-        db_query("UPDATE users SET waiting_for_key=1 WHERE user_id=?", (user.id,))
-        await update.message.reply_text("🔑 **Please send your Access Key in the chat now:**", parse_mode="Markdown")
-        return
-
-    code = args[0].strip()
-    key_data = db_query("SELECT duration_text, duration_seconds, is_redeemed FROM keys WHERE code=?", (code,), "one")
-    if not key_data:
-        await update.message.reply_text("❌ **Invalid Access Key!**", parse_mode="Markdown")
-        return
-    if key_data["is_redeemed"] == 1:
-        await update.message.reply_text("❌ **This key has already been redeemed!**", parse_mode="Markdown")
-        return
-
-    dur_text, dur_secs = key_data["duration_text"], key_data["duration_seconds"]
-    if dur_secs >= 999999999:
-        new_expires = "Lifetime"
-    else:
-        current_user = db_query("SELECT is_premium, premium_expires FROM users WHERE user_id=?", (user.id,), "one")
-        base_time = datetime.now()
-        if current_user and current_user["is_premium"] and current_user["premium_expires"] != "Lifetime":
-            try:
-                exp_dt = datetime.fromisoformat(current_user["premium_expires"])
-                if exp_dt > base_time:
-                    base_time = exp_dt
-            except Exception:
-                pass
-        new_expires = (base_time + timedelta(seconds=dur_secs)).isoformat()
-
-    db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE code=?", (user.id, code))
-    db_query("UPDATE users SET is_premium=1, premium_expires=? WHERE user_id=?", (new_expires, user.id))
-
-    await update.message.reply_text(
-        f"🎉 **SUBSCRIPTION ACTIVATED!** 🎉\n\n"
-        f"✨ Plan Duration: **{dur_text}**\n"
-        f"⏳ Valid Until: `{new_expires}`",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu(user.id)
-    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -622,56 +489,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=get_join_menu()
         )
-        return
-
-    user_state = db_query("SELECT waiting_for_key FROM users WHERE user_id=?", (user.id,), "one")
-    if not user_state:
-        return
-
-    # Key Redemption Logic via chat message
-    if user_state["waiting_for_key"] == 1:
-        db_query("UPDATE users SET waiting_for_key=0 WHERE user_id=?", (user.id,))
-        code = text.strip()
-        
-        key_data = db_query("SELECT duration_text, duration_seconds, is_redeemed FROM keys WHERE code=?", (code,), "one")
-        if not key_data:
-            await update.message.reply_text("❌ **Invalid Access Key!** Please check your key.", parse_mode="Markdown")
-            return
-        if key_data["is_redeemed"] == 1:
-            await update.message.reply_text("❌ **This key has already been redeemed!**", parse_mode="Markdown")
-            return
-
-        dur_text, dur_secs = key_data["duration_text"], key_data["duration_seconds"]
-        if dur_secs >= 999999999:
-            new_expires = "Lifetime"
-        else:
-            current_user = db_query("SELECT is_premium, premium_expires FROM users WHERE user_id=?", (user.id,), "one")
-            base_time = datetime.now()
-            if current_user and current_user["is_premium"] and current_user["premium_expires"] != "Lifetime":
-                try:
-                    exp_dt = datetime.fromisoformat(current_user["premium_expires"])
-                    if exp_dt > base_time:
-                        base_time = exp_dt
-                except Exception:
-                    pass
-            new_expires = (base_time + timedelta(seconds=dur_secs)).isoformat()
-
-        db_query("UPDATE keys SET is_redeemed=1, redeemed_by=? WHERE code=?", (user.id, code))
-        db_query("UPDATE users SET is_premium=1, premium_expires=? WHERE user_id=?", (new_expires, user.id))
-
-        await update.message.reply_text(
-            f"🎉 **SUBSCRIPTION ACTIVATED!** 🎉\n\n"
-            f"✨ Plan Duration: **{dur_text}**\n"
-            f"⏳ Valid Until: `{new_expires}`",
-            parse_mode="Markdown",
-            reply_markup=get_main_menu(user.id)
-        )
-        return
-
-    # Cookie Checker Logic
-    is_prem = check_user_premium(user.id)
-    if not is_prem and user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ **Access Denied:** Your subscription has expired. Redeem a key to continue checking.", parse_mode="Markdown")
         return
 
     status_msg = await update.message.reply_text("⏳ <i>Processing cookies and generating tokens...</i>", parse_mode="HTML")
@@ -730,42 +547,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[DEBUG] Checker Exception: {e}")
         await status_msg.edit_text(f"❌ <b>An error occurred:</b> <code>{str(e)}</code>", parse_mode="HTML")
 
-async def add_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Usage: `/addkey <duration> [custom_code]`\nExample: `/addkey 7d` or `/addkey lifetime mykey`", parse_mode="Markdown")
-        return
-
-    dur_str = args[0]
-    dur_text, dur_secs = parse_duration(dur_str)
-    if not dur_text:
-        await update.message.reply_text("❌ Invalid duration format! Use formats like `30m`, `2h`, `7d`, `1y`, or `lifetime`.", parse_mode="Markdown")
-        return
-
-    code = args[1] if len(args) > 1 else f"kudasaivip-{''.join(random.choices(string.ascii_lowercase + string.digits, k=8))}"
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    db_query("INSERT OR REPLACE INTO keys (code, duration_text, duration_seconds, is_redeemed, created_at) VALUES (?, ?, ?, 0, ?)", (code, dur_text, dur_secs, created_at))
-    await update.message.reply_text(
-        f"✅ **Access Key Created Successfully!**\n\n"
-        f"• Code: `{code}`\n"
-        f"• Duration: **{dur_text}**",
-        parse_mode="Markdown"
-    )
-
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"Membership Status: {'Active 🟢' if check_user_premium(u.effective_user.id) else 'Expired 🔴'}")))
-    app.add_handler(CommandHandler("redeem", redeem_command))
+    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, "Bot status: Online & Free to use!")))
     app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
-    app.add_handler(CommandHandler("addkey", add_key_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Netflix Bot with Channel/Group Lock & Duration Keys is online!")
+    print("[+] Kudasai Keyless Netflix Bot is online!")
     app.run_polling()
 
 if __name__ == "__main__":
