@@ -27,6 +27,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIGURATION
 TELEGRAM_BOT_TOKEN = "8597687291:AAGoa2PQL6glLjyT2Tb-qH8MXRm9h_8jutc"
 OWNER_HANDLE = "@kudsoo"
+BOT_HANDLE = "@kudasaixddbot"
 
 REQUIRED_CHANNEL = "@kudsiontop"
 CHANNEL_LINK = "https://t.me/kudsiontop"
@@ -469,7 +470,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"• Total Registered Users: `{users_count}`\n"
-            f"• Status: Key system removed & group link updated",
+            f"• Status: Watermark added & group link active",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
@@ -527,7 +528,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📞 {acc['phone']}  {pv}\n"
             f"👥 Profiles ({acc['profile_count']}): {profs}\n\n"
             f"🍪 <b>Cookie Snippet</b>\n"
-            f"<code>NetflixId={nf_id[:30]}...</code>"
+            f"<code>NetflixId={nf_id[:30]}...</code>\n\n"
+            f"──────────────────\n"
+            f"👑 <b>Developer:</b> {OWNER_HANDLE}\n"
+            f"🤖 <b>Bot:</b> {BOT_HANDLE}"
         )
 
         buttons = []
@@ -551,12 +555,12 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, "Bot status: Online & Free to use!")))
+    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, "Bot status: Online & Watermarked!")))
     app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Keyless Netflix Bot is online with the updated group link!")
+    print("[+] Kudasai Keyless Netflix Bot is online with watermark!")
     app.run_polling()
 
 if __name__ == "__main__":
