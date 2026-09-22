@@ -31,8 +31,8 @@ OWNER_HANDLE = "@kudsoo"
 REQUIRED_CHANNEL = "@kudsiontop"
 CHANNEL_LINK = "https://t.me/kudsiontop"
 
-REQUIRED_GROUP = "@kudaisimpressed"
-GROUP_LINK = "https://t.me/kudaisimpressed"
+REQUIRED_GROUP = "@kudasaiisimpressed"
+GROUP_LINK = "https://t.me/kudasaiisimpressed"
 
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
 
@@ -469,7 +469,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"• Total Registered Users: `{users_count}`\n"
-            f"• Status: Key system permanently removed (Free access)",
+            f"• Status: Key system removed & group link updated",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
@@ -556,7 +556,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Keyless Netflix Bot is online!")
+    print("[+] Kudasai Keyless Netflix Bot is online with the updated group link!")
     app.run_polling()
 
 if __name__ == "__main__":
