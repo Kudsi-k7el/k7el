@@ -1,7 +1,8 @@
+
 #!/usr/bin/env python3
 """
-KRAZY BOT — Telegram Hotmail Checker
-Premium emoji + cleaner fonts
+KUDASAI BOT — Telegram Hotmail Checker
+Standard emojis enabled for non-premium accounts
 """
 
 import asyncio
@@ -28,6 +29,15 @@ import xbox_puller
 import xbox_checker
 import krazii_runner
 import steam_checker
+import roblox_checker
+import supercell_checker
+import crunchyroll_checker
+import XboxGames_Checker
+import Xbox_FullCap
+import boosteroid_checker
+import joyark_checker
+import airgpu_checker
+import disney_checker
 import inboxer
 import proxytools
 
@@ -41,48 +51,37 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("krazybot")
+logger = logging.getLogger("kudasaibot")
 
 user_jobs = {}
 user_jobs_lock = asyncio.Lock()
-scan_lock = asyncio.Lock()
-scan_waiting = []
+# Two independent queues: scans (Hotmail+Xbox) and extracts (Krazii)
+scan_lock = asyncio.Lock()  # One scan at a time (Hotmail + Xbox share)
+scan_waiting = []  # list of user_ids waiting for scan
 scan_waiting_lock = asyncio.Lock()
-extract_lock = asyncio.Lock()
-extract_waiting = []
+extract_lock = asyncio.Lock()  # One extract at a time
+extract_waiting = []  # list of user_ids waiting for extract
 extract_waiting_lock = asyncio.Lock()
 
-user_states = {}
-user_futures = {}
-user_status_msgs = {}
-last_extract_times = {}
-paid_orders = set()
+user_states = {}  # user_id -> state (CheckState or XboxState)
+user_futures = {}  # user_id -> future
+user_status_msgs = {}  # user_id -> status_msg
+last_extract_times = {}  # user_id -> timestamp for 60s cooldown
+paid_orders = set()  # consumed pay_ok_/pay_no_ refs (single-use guard vs double-tap)
 
-PREMIUM_IDS = config.PREMIUM_EMOJI_IDS
-EMOJI_FALLBACK = {
-    "📤": "🚀",
-    "📧": "📝",
-    "⏰": "⏳",
-    "🔐": "💎",
-    "❓": "💠",
-    "📥": "📦",
-    "🔒": "🛑",
-}
-
+# --- Standard Emoji Helper (Non-Premium Safe) ---
 def pe(char: str) -> str:
-    lookup = EMOJI_FALLBACK.get(char, char)
-    eid = PREMIUM_IDS.get(lookup)
-    if not eid:
-        eid = PREMIUM_IDS.get(char)
-        lookup = char
-    if eid:
-        return f'<tg-emoji emoji-id="{eid}">{lookup}</tg-emoji>'
+    """Return standard emoji text so non-premium accounts can view them perfectly."""
     return char
 
 def is_owner(user_id: int) -> bool:
     return user_id == config.OWNER_ID
 
 def get_user_limits(user_id: int, checker_type="hotmail"):
+    """Returns (plan, limit, threads, expires_at). checker_type hotmail, xbox or steam.
+    Limits are per-checker lines-per-file: hotmail 2000/5000/10000,
+    xbox 1000/2500/5000, steam 1000/2500/5000 (fixed 15 threads all tiers).
+    inbox: hotmail line limits, own 5/10/20 threads."""
     plan, expires_at, was_expired = database.get_user_plan(user_id)
     if checker_type == "xbox":
         limit = config.TIER_XBOX_LIMITS.get(plan, 1000)
@@ -101,6 +100,19 @@ def get_user_limits(user_id: int, checker_type="hotmail"):
         threads = config.TIER_THREADS.get(plan, 20)
     return plan, limit, threads, expires_at
 
+def format_plan_info(user_id: int) -> str:
+    plan, _, _, expires_at = get_user_limits(user_id)
+    exp_str = "never (permanent)" if expires_at is None else f"{expires_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    if plan == "free":
+        exp_str = "never (permanent)"
+    return (
+        f"👤 Your Plan: {plan}\n"
+        f"📧 Hotmail: {config.TIER_THREADS.get(plan, 20)} thr / {config.TIER_HOTMAIL_LIMITS.get(plan, 2000)} lines\n"
+        f"🎯 Xbox: {config.TIER_XBOX_THREADS.get(plan, 5)} thr / {config.TIER_XBOX_LIMITS.get(plan, 1000)} lines\n"
+        f"🎮 Steam: {config.STEAM_THREADS} thr / {config.TIER_STEAM_LIMITS.get(plan, 1000)} lines\n"
+        f"⏰ Expires: {exp_str}\n"
+    )
+
 def format_plan_info_html(user_id: int, checker_type="hotmail", single=False) -> str:
     plan, limit, threads, expires_at = get_user_limits(user_id, checker_type)
     exp_str = "never (permanent)" if expires_at is None else f"{expires_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
@@ -108,6 +120,7 @@ def format_plan_info_html(user_id: int, checker_type="hotmail", single=False) ->
         exp_str = "never (permanent)"
     plan_e = html.escape(plan)
     exp_e = html.escape(exp_str)
+    # Show ONLY the selected checker (other rows confused users mid-run)
     hot_threads = config.TIER_THREADS.get(plan, 20)
     xbox_threads = config.TIER_XBOX_THREADS.get(plan, 5)
     inbox_threads = config.TIER_INBOX_THREADS.get(plan, 5)
@@ -141,6 +154,7 @@ def format_plan_info_html(user_id: int, checker_type="hotmail", single=False) ->
     )
 
 def sexy(text: str) -> str:
+    """Convert ASCII to bold serif sexy font for buttons (A-Z, a-z, 0-9)."""
     bold_map = {}
     for i in range(26):
         bold_map[chr(65+i)] = chr(0x1D400 + i)
@@ -154,19 +168,19 @@ def sexy(text: str) -> str:
 
 def main_menu_keyboard(is_owner_flag=False):
     kb = [
-        [InlineKeyboardButton(sexy("Start Scan"), callback_data="menu_scan", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔥"])],
-        [InlineKeyboardButton(sexy("Start Extracting"), callback_data="menu_extract", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💠"])],
-        [InlineKeyboardButton(sexy("Plans"), callback_data="menu_plans", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📋"]), InlineKeyboardButton(sexy("Stats"), callback_data="menu_stats", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📊"])],
-        [InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔌"])],
+        [InlineKeyboardButton(sexy("Start Scan"), callback_data="menu_scan")],
+        [InlineKeyboardButton(sexy("Start Extracting"), callback_data="menu_extract")],
+        [InlineKeyboardButton(sexy("Plans"), callback_data="menu_plans"), InlineKeyboardButton(sexy("Stats"), callback_data="menu_stats")],
+        [InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies")],
     ]
     if is_owner_flag:
-        kb.append([InlineKeyboardButton(sexy("Owner Panel"), callback_data="owner_panel", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🤵"])])
+        kb.append([InlineKeyboardButton(sexy("Owner Panel"), callback_data="owner_panel")])
     return InlineKeyboardMarkup(kb)
 
 def extract_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(sexy("Logs Extractor"), callback_data="extract_krazii", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💠"])],
-        [InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+        [InlineKeyboardButton(sexy("Logs Extractor"), callback_data="extract_krazii")],
+        [InlineKeyboardButton(sexy("Back"), callback_data="back_main")],
     ])
 
 def extract_opts_keyboard(selected):
@@ -177,83 +191,44 @@ def extract_opts_keyboard(selected):
         [InlineKeyboardButton(f"{check(selected.get('tdata', False))} {sexy('Telegram Tdata')}", callback_data="toggle_tdata")],
         [InlineKeyboardButton(f"{check(selected.get('tokens', False))} {sexy('Discord Tokens')}", callback_data="toggle_tokens")],
         [InlineKeyboardButton(f"{check(selected.get('cookies', False))} {sexy('Cookies')}", callback_data="toggle_cookies")],
-        [InlineKeyboardButton(sexy("Confirm"), callback_data="extract_confirm", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["✅"]), InlineKeyboardButton(sexy("Cancel"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["❌"])],
+        [InlineKeyboardButton(sexy("Confirm"), callback_data="extract_confirm"), InlineKeyboardButton(sexy("Cancel"), callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(kb)
 
 def scan_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(sexy("Hotmail Checker"), callback_data="checker_hotmail", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📝"])],
-        [InlineKeyboardButton(sexy("Hotmail Inboxer"), callback_data="checker_inbox", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["✉️"])],
-        [InlineKeyboardButton(sexy("Steam Checker"), callback_data="checker_steam", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💎"])],
-        [InlineKeyboardButton(sexy("Xbox Checker"), callback_data="checker_xboxapi", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🏆"])],
-        [InlineKeyboardButton(sexy("Xbox Code Puller"), callback_data="checker_xbox", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🎯"])],
-        [InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+        [InlineKeyboardButton(sexy("Hotmail Checker"), callback_data="checker_hotmail")],
+        [InlineKeyboardButton(sexy("Hotmail Inboxer"), callback_data="checker_inbox")],
+        [InlineKeyboardButton(sexy("Steam Checker"), callback_data="checker_steam")],
+        [InlineKeyboardButton(sexy("Xbox Checker"), callback_data="checker_xboxapi")],
+        [InlineKeyboardButton(sexy("Xbox Code Puller"), callback_data="checker_xbox")],
+        [InlineKeyboardButton(sexy("Back"), callback_data="back_main")],
     ])
 
 def owner_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(sexy("Generate Key"), callback_data="owner_genkey", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💎"])],
-        [InlineKeyboardButton(sexy("Broadcast"), callback_data="owner_broadcast", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📦"])],
-        [InlineKeyboardButton(sexy("Bot Stats"), callback_data="owner_stats", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📊"])],
-        [InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+        [InlineKeyboardButton(sexy("Generate Key"), callback_data="owner_genkey")],
+        [InlineKeyboardButton(sexy("Broadcast"), callback_data="owner_broadcast")],
+        [InlineKeyboardButton(sexy("Bot Stats"), callback_data="owner_stats")],
+        [InlineKeyboardButton(sexy("Back"), callback_data="back_main")],
     ])
 
 def key_gen_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(sexy("Free - 30d (1 Key)"), callback_data="genkey_free_30_1", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💠"])],
-        [InlineKeyboardButton(sexy("Pro - 30d (1 Key)"), callback_data="genkey_pro_30_1", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💳"])],
-        [InlineKeyboardButton(sexy("Max - 30d (1 Key)"), callback_data="genkey_max_30_1", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💎"])],
-        [InlineKeyboardButton(sexy("Pro - 7d (5 Keys)"), callback_data="genkey_pro_7_5", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💳"])],
-        [InlineKeyboardButton(sexy("Max - 7d (5 Keys)"), callback_data="genkey_max_7_5", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💎"])],
-        [InlineKeyboardButton(sexy("Custom - Use /key"), callback_data="owner_genkey_custom", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📝"])],
-        [InlineKeyboardButton(sexy("Back"), callback_data="owner_panel", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
-    ])
-
-def join_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(sexy("Join Krazy Cloud"), url="https://t.me/krazycloudextra", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🌐"])],
-        [InlineKeyboardButton(sexy("Join Krazy Bots"), url="https://t.me/krazycloudbots", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🤖"])],
-        [InlineKeyboardButton(sexy("Verify Join"), callback_data="check_join", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["✅"])],
+        [InlineKeyboardButton(sexy("Free - 30d (1 Key)"), callback_data="genkey_free_30_1")],
+        [InlineKeyboardButton(sexy("Pro - 30d (1 Key)"), callback_data="genkey_pro_30_1")],
+        [InlineKeyboardButton(sexy("Max - 30d (1 Key)"), callback_data="genkey_max_30_1")],
+        [InlineKeyboardButton(sexy("Pro - 7d (5 Keys)"), callback_data="genkey_pro_7_5")],
+        [InlineKeyboardButton(sexy("Max - 7d (5 Keys)"), callback_data="genkey_max_7_5")],
+        [InlineKeyboardButton(sexy("Custom - Use /key"), callback_data="owner_genkey_custom")],
+        [InlineKeyboardButton(sexy("Back"), callback_data="owner_panel")],
     ])
 
 async def is_user_joined(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if is_owner(user_id):
-        return True
-    for ch in config.REQUIRED_CHANNELS:
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch["username"], user_id=user_id)
-            if member.status in ("left", "kicked", "banned"):
-                return False
-        except BadRequest as e:
-            if "Chat not found" in str(e):
-                logger.warning(f"Channel {ch['username']} not found, skipping join check")
-                continue
-            logger.warning(f"get_chat_member failed for {ch['username']}: {e}")
-            return False
-        except Exception as e:
-            logger.warning(f"get_chat_member exception for {ch['username']}: {e}")
-            return False
     return True
 
 async def send_join_required(update_or_query, context: ContextTypes.DEFAULT_TYPE, edit=False):
-    text = (
-        f"{pe('🛑')} <b>Join Required</b>\n\n"
-        f"You must join both channels to use this bot:\n"
-        f"{pe('🌐')} <b>Krazy Cloud</b> — https://t.me/krazycloudextra\n"
-        f"{pe('🤖')} <b>Krazy Bots</b> — https://t.me/krazycloudbots\n\n"
-        f"<i>Join both and click</i> <b>Verify</b> <i>below.</i>"
-    )
-    kb = join_keyboard()
-    try:
-        if edit and hasattr(update_or_query, "edit_message_text"):
-            await update_or_query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
-        elif hasattr(update_or_query, "message") and update_or_query.message:
-            await update_or_query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
-        else:
-            await update_or_query.reply_text(text, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        logger.warning(f"send_join_required failed: {e}")
+    pass
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -295,8 +270,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("user card failed")
         user_card = "Plan: free"
     text = (
-        f"{pe('🤖')} <b>KRAZY CRACKING BOT</b>\n"
-        f"<pre>krazy cloud • premium</pre>\n\n"
+        f"{pe('🤖')} <b>KUDASAI CRACKING BOT</b>\n"
+        f"<pre>kudasai cloud • premium</pre>\n\n"
         f"{user_card}\n\n"
         f"{pe('📝')} <b>How to use:</b>\n"
         f"<blockquote>"
@@ -335,7 +310,7 @@ async def cmd_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (
         f"{pe('🤵')} <b>Owner Panel</b>\n"
-        f"<pre>administrator • krazy cloud</pre>\n\n"
+        f"<pre>administrator • kudasai cloud</pre>\n\n"
         f"Welcome, Owner! Choose an option:\n"
         f"<blockquote>"
         f"{pe('💎')} <b>Generate Key</b> — Create redeem keys\n"
@@ -394,7 +369,7 @@ async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="HTML")
         tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt", encoding="utf-8")
         try:
-            tmp.write(f"# KRAZY BOT Keys — Plan: {plan} | Duration: {days} days | Generated: {datetime.utcnow().isoformat()} UTC\n")
+            tmp.write(f"# KUDASAI BOT Keys — Plan: {plan} | Duration: {days} days | Generated: {datetime.utcnow().isoformat()} UTC\n")
             tmp.write(f"# Owner: {user_id}\n\n")
             for k in keys:
                 tmp.write(f"{k}\n")
@@ -402,7 +377,7 @@ async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=open(tmp.name, "rb"),
-                filename=f"krazy_keys_{plan}_{days}d_{count}.txt",
+                filename=f"kudasai_keys_{plan}_{days}d_{count}.txt",
                 caption=f"{pe('💎')} All {count} keys — {html.escape(plan)} {days}d"
             )
         finally:
@@ -474,8 +449,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     if data == "back_main":
         text = (
-            f"{pe('🤖')} <b>KRAZY CRACKING BOT</b>\n"
-            f"<pre>krazy cloud • premium</pre>\n\n"
+            f"{pe('🤖')} <b>KUDASAI CRACKING BOT</b>\n"
+            f"<pre>kudasai cloud • premium</pre>\n\n"
             f"{format_plan_info_html(user_id)}\n\n"
             f"{pe('📝')} <b>How to use:</b>\n"
             f"<blockquote>"
@@ -490,7 +465,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_scan":
         text = (
             f"{pe('🚀')} <b>Start Scan</b>\n"
-            f"<pre>choose checker • krazy</pre>\n\n"
+            f"<pre>choose checker • kudasai</pre>\n\n"
             f"{pe('✉️')} <b>MAIL CHECKERS</b>\n"
             f"<blockquote>"
             f"{pe('📧')} <b>Hotmail Checker</b> — Check Hotmail/Outlook accounts\n"
@@ -511,7 +486,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "menu_extract":
         text = (
             f"{pe('💠')} <b>Start Extracting</b>\n"
-            f"<pre>choose extractor • krazy</pre>\n\n"
+            f"<pre>choose extractor • kudasai</pre>\n\n"
             f"Choose an extractor to start:\n"
             f"<blockquote>"
             f"{pe('💠')} <b>Logs Extractor</b> — KraziiCloud Multi-Log Extractor\n"
@@ -529,7 +504,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["krazii_opts"] = opts
         text = (
             f"{pe('💠')} <b>Logs Extractor</b>\n"
-            f"<pre>krazii • logs • krazy</pre>\n\n"
+            f"<pre>krazii • logs • kudasai</pre>\n\n"
             f"{pe('📋')} Select what to extract:\n"
             f"<blockquote>Tap to toggle, then Confirm.</blockquote>"
         )
@@ -559,7 +534,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Extractor is Pro/Max only.", show_alert=True)
             try:
                 await query.edit_message_text(
-                    f"{pe('💎')} <b>Pro / Max Only</b>\n<pre>krazii • premium • krazy</pre>\n\n"
+                    f"{pe('💎')} <b>Pro / Max Only</b>\n<pre>krazii • premium • kudasai</pre>\n\n"
                     f"The Logs Extractor is for <code>pro</code> (2GB max) and <code>max</code> (5GB max) users.\n"
                     f"Redeem a key with <code>/redeem &lt;key&gt;</code> to upgrade.",
                     parse_mode="HTML")
@@ -583,7 +558,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_mb = config.TIER_EXTRACTOR_MAX_MB.get(plan, 500)
         text = (
             f"{pe('📦')} <b>Send Download Link</b>\n"
-            f"<pre>krazii • link • krazy</pre>\n\n"
+            f"<pre>krazii • link • kudasai</pre>\n\n"
             f"Plan <code>{html.escape(plan)}</code> max <code>{max_mb}MB</code> per file | Cooldown <code>60s</code>\n"
             f"Send a <b>direct link</b> to <code>.zip/.rar/.7z</code> (500MB-4GB):\n"
             f"<code>https://example.com/logs.zip</code>\n\n"
@@ -608,7 +583,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Max {limit} combos per file for your plan. Upgrade via /redeem if needed.</i>"
         )
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "checker_xbox":
@@ -622,7 +597,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   if plan == "free" and user_id != config.OWNER_ID else "")
         text = (
             f"{pe('🎯')} <b>Xbox Code Puller</b>\n"
-            f"<pre>xbox • codes • krazy</pre>\n\n"
+            f"<pre>xbox • codes • kudasai</pre>\n\n"
             f"{pe('👤')} Your Plan: <code>{html.escape(plan)}</code>\n"
             f"{pe('📦')} Limit: <code>{limit}</code> <i>combos/file</i> | {pe('⚡')} Threads: <code>{threads}</code> {pe('🔥')}{_quota}\n\n"
             f"{pe('📤')} <b>Please send your file</b>\n"
@@ -633,7 +608,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Max {limit} combos per file for your plan. Upgrade via /redeem if needed.</i>"
         )
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "checker_xboxapi":
@@ -648,7 +623,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   if plan == "free" and user_id != config.OWNER_ID else "")
         text = (
             f"{pe('🏆')} <b>Xbox Checker</b>\n"
-            f"<pre>xbox • full cap • krazy</pre>\n\n"
+            f"<pre>xbox • full cap • kudasai</pre>\n\n"
             f"{pe('👤')} Your Plan: <code>{html.escape(plan)}</code>\n"
             f"{pe('📦')} Limit: <code>{limit}</code> <i>combos/file</i> | {pe('⚡')} Threads: <code>{threads}</code> | {pe('🚀')} <code>{cpm} CPM</code>{_quota}\n\n"
             f"{pe('📤')} <b>Please send your file</b>\n"
@@ -659,7 +634,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Max {limit} combos per file for your plan. Upgrade via /redeem if needed.</i>"
         )
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "checker_steam":
@@ -673,7 +648,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   if plan == "free" and user_id != config.OWNER_ID else "")
         text = (
             f"{pe('🔍')} <b>Steam Checker</b>\n"
-            f"<pre>steam • capture • krazy</pre>\n\n"
+            f"<pre>steam • capture • kudasai</pre>\n\n"
             f"{pe('👤')} Your Plan: <code>{html.escape(plan)}</code>\n"
             f"{pe('📦')} Limit: <code>{limit}</code> <i>combos/file</i> | {pe('⚡')} Threads: <code>{threads}</code> (fixed){_quota}\n\n"
             f"{pe('📤')} <b>Please send your file</b>\n"
@@ -684,7 +659,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Max {limit} combos per file for your plan. Upgrade via /redeem if needed.</i>"
         )
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "checker_inbox":
@@ -692,7 +667,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan, limit, threads, _ = get_user_limits(user_id, "inbox")
         text = (
             f"{pe('✉️')} <b>Hotmail Inboxer</b>\n"
-            f"<pre>inbox • 36 services • krazy</pre>\n\n"
+            f"<pre>inbox • 36 services • kudasai</pre>\n\n"
             f"{pe('👤')} Your Plan: <code>{html.escape(plan)}</code>\n"
             f"{pe('📦')} Limit: <code>{limit}</code> <i>combos/file</i> | {pe('⚡')} Threads: <code>{threads}</code>\n\n"
             f"{pe('📤')} <b>Please send your file</b>\n"
@@ -703,7 +678,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Max {limit} combos per file for your plan. Upgrade via /redeem if needed.</i>"
         )
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_scan")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "menu_proxies":
@@ -714,7 +689,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _working_n = sum(1 for _, ok in _all if ok)
         text = (
             f"{pe('🔌')} <b>Proxies</b> <i>(Steam pool)</i>\n"
-            f"<pre>proxy • pool • krazy</pre>\n\n"
+            f"<pre>proxy • pool • kudasai</pre>\n\n"
             f"{pe('📦')} Stored: <code>{len(_all)}/{config.PROXY_MAX_STORED}</code> | "
             f"{pe('✅')} Working: <code>{_working_n}</code>\n\n"
             f"<blockquote>"
@@ -726,10 +701,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Steam Checker requires 1+ working proxy.</i>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(sexy("Add"), callback_data="proxy_add", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📦"]),
-             InlineKeyboardButton(sexy("Recheck"), callback_data="proxy_recheck", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
-            [InlineKeyboardButton(sexy("Clear"), callback_data="proxy_clear", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"]),
-             InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+            [InlineKeyboardButton(sexy("Add"), callback_data="proxy_add"),
+             InlineKeyboardButton(sexy("Recheck"), callback_data="proxy_recheck")],
+            [InlineKeyboardButton(sexy("Clear"), callback_data="proxy_clear"),
+             InlineKeyboardButton(sexy("Back"), callback_data="back_main")],
         ])
         try:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -740,7 +715,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 f"{pe('📤')} <b>Add Proxies</b>\n"
-                f"<pre>paste or .txt • krazy</pre>\n\n"
+                f"<pre>paste or .txt • kudasai</pre>\n\n"
                 f"Send proxy lines now (paste text <i>or</i> a <code>.txt</code> file):\n"
                 f"<code>ip:port</code> • <code>ip:port:user:pass</code> • <code>http://...</code>\n\n"
                 f"<i>Or /cancel to abort.</i>",
@@ -785,11 +760,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=(f"{pe('✅')} <b>Pool Rechecked</b>\n"
-                      f"<pre>fast • clean • krazy</pre>\n\n"
+                      f"<pre>fast • clean • kudasai</pre>\n\n"
                       f"{pe('✅')} Kept: <code>{len(working)}</code> (avg <code>{avg:.0f}ms</code>)\n"
                       f"{pe('❌')} Removed: <code>{len(dead)}</code>"),
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_proxies", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="menu_proxies")]]))
         except:
             pass
     elif data == "proxy_clear":
@@ -807,23 +782,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text(
                 f"{pe('🔌')} <b>Proxies</b> <i>(Steam pool)</i>\n"
-                f"<pre>proxy • pool • krazy</pre>\n\n"
+                f"<pre>proxy • pool • kudasai</pre>\n\n"
                 f"{pe('📦')} Stored: <code>{len(_all)}/{config.PROXY_MAX_STORED}</code> | "
                 f"{pe('✅')} Working: <code>{_working_n}</code>\n\n"
                 f"<i>Cleared <code>{n}</code>. Add fresh proxies to run Steam.</i>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(sexy("Add"), callback_data="proxy_add", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["📦"]),
-                     InlineKeyboardButton(sexy("Recheck"), callback_data="proxy_recheck", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
-                    [InlineKeyboardButton(sexy("Clear"), callback_data="proxy_clear", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"]),
-                     InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+                    [InlineKeyboardButton(sexy("Add"), callback_data="proxy_add"),
+                     InlineKeyboardButton(sexy("Recheck"), callback_data="proxy_recheck")],
+                    [InlineKeyboardButton(sexy("Clear"), callback_data="proxy_clear"),
+                     InlineKeyboardButton(sexy("Back"), callback_data="back_main")],
                 ]))
         except:
             pass
     elif data == "menu_plans":
         text = (
             f"{pe('📋')} <b>Plans &amp; Features</b>\n"
-            f"<pre>krazy cloud tiers</pre>\n\n"
+            f"<pre>kudasai cloud tiers</pre>\n\n"
             f"{pe('💠')} <b>Free Plan</b>\n"
             f"<i>No costs. Anyone can use for free.</i>\n"
             f"<blockquote>"
@@ -876,8 +851,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         try:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(sexy("Buy Plan"), callback_data="buy_menu", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💰"])],
-                [InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+                [InlineKeyboardButton(sexy("Buy Plan"), callback_data="buy_menu")],
+                [InlineKeyboardButton(sexy("Back"), callback_data="back_main")],
             ]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
@@ -914,7 +889,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      if _xapi is not None else "")
         personal = (
             f"{pe('📊')} <b>Your Stats</b> {pe('📈')}\n"
-            f"<pre>personal • krazy</pre>\n\n"
+            f"<pre>personal • kudasai</pre>\n\n"
             f"<blockquote>"
             f"{pe('🤵')} User ID: <code>{user_id}</code>\n"
             f"{pe('💎')} Plan: <code>{html.escape(plan)}</code>\n"
@@ -936,7 +911,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"</blockquote>"
             )
         try:
-            await query.edit_message_text(personal, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="back_main", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(personal, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="back_main")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=personal, parse_mode="HTML")
     elif data == "owner_panel":
@@ -945,7 +920,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = (
             f"{pe('🤵')} <b>Owner Panel</b>\n"
-            f"<pre>administrator • krazy cloud</pre>\n\n"
+            f"<pre>administrator • kudasai cloud</pre>\n\n"
             f"<i>Choose an option:</i>"
         )
         try:
@@ -972,7 +947,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"{pe('📝')} <b>Custom Key</b>\n\n<i>Send command as:</i> <code>/key max 30 1</code>\n<i>Plans: free/pro/max | days &gt;0 | count 1-20</i>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="owner_genkey", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="owner_genkey")]]))
         )
     elif data.startswith("genkey_"):
         if not is_owner(user_id):
@@ -987,7 +962,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keys_text = "\n".join(f"<code>{html.escape(k)}</code>" for k in keys)
             msg = header + keys_text
             try:
-                await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="owner_genkey", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+                await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="owner_genkey")]]))
             except:
                 await context.bot.send_message(chat_id=query.message.chat_id, text=msg, parse_mode="HTML")
             if count >= 5:
@@ -1017,7 +992,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<i>Send your message now, or /cancel to abort.</i>"
         )
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="owner_panel", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="owner_panel")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "owner_stats":
@@ -1028,7 +1003,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats = await asyncio.to_thread(database.get_stats)
             text = (
                 f"{pe('📊')} <b>Bot Stats</b>\n"
-                f"<pre>global • krazy cloud</pre>\n\n"
+                f"<pre>global • kudasai cloud</pre>\n\n"
                 f"<blockquote>"
                 f"Total Users: <code>{stats.get('total_users',0)}</code>\n"
                 f"By Plan: <code>{html.escape(str(stats.get('by_plan',{})))}</code>\n"
@@ -1039,7 +1014,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             text = f"{pe('❌')} Failed to get stats: <code>{html.escape(str(e))}</code>"
         try:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="owner_panel", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])]]))
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Back"), callback_data="owner_panel")]]))
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="HTML")
     elif data == "cancel_job":
@@ -1071,7 +1046,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 await query.answer("🛑 Queued job cancelled.", show_alert=True)
                 try:
-                    await query.edit_message_text(f"{pe('🛑')} <b>Cancelled Queued</b> {pe('❌')}\n<pre>krazy • stopped</pre>\n<i>Your queued job was cancelled.</i>", parse_mode="HTML")
+                    await query.edit_message_text(f"{pe('🛑')} <b>Cancelled Queued</b> {pe('❌')}\n<pre>kudasai • stopped</pre>\n<i>Your queued job was cancelled.</i>", parse_mode="HTML")
                 except:
                     pass
                 return
@@ -1088,14 +1063,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         await query.answer("🛑 Cancelling... Please wait a moment.", show_alert=False)
         try:
-            await query.edit_message_text(f"{pe('🛑')} <b>Cancelled</b> {pe('❌')}\n<pre>krazy • stopped</pre>\n<i>Your check has been cancelled.</i>", parse_mode="HTML")
+            await query.edit_message_text(f"{pe('🛑')} <b>Cancelled</b> {pe('❌')}\n<pre>kudasai • stopped</pre>\n<i>Your check has been cancelled.</i>", parse_mode="HTML")
         except:
             await context.bot.send_message(chat_id=query.message.chat_id, text=f"{pe('🛑')} Cancelled.")
         return
     elif data == "buy_menu":
         text = (
             f"{pe('🛒')} <b>Buy Plan</b>\n"
-            f"<pre>krazy • premium • purchase</pre>\n\n"
+            f"<pre>kudasai • premium • purchase</pre>\n\n"
             f"Which plan do you want to buy?\n"
             f"<blockquote>"
             f"{pe('💳')} <b>Pro</b> — <code>{config.BUY_PRICES[('pro', 7)]}$ / week</code> • <code>{config.BUY_PRICES[('pro', 30)]}$ / month</code>\n"
@@ -1103,9 +1078,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"</blockquote>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(sexy("Pro Plan"), callback_data="buy_pro", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💳"])],
-            [InlineKeyboardButton(sexy("Max Plan"), callback_data="buy_max", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["💎"])],
-            [InlineKeyboardButton(sexy("Back"), callback_data="menu_plans", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+            [InlineKeyboardButton(sexy("Pro Plan"), callback_data="buy_pro")],
+            [InlineKeyboardButton(sexy("Max Plan"), callback_data="buy_max")],
+            [InlineKeyboardButton(sexy("Back"), callback_data="menu_plans")],
         ])
         try:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1116,7 +1091,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_key = "pro" if data == "buy_pro" else "max"
         text = (
             f"{pe('💰')} <b>Buy {plan_name}</b>\n"
-            f"<pre>krazy • {plan_key} • duration</pre>\n\n"
+            f"<pre>kudasai • {plan_key} • duration</pre>\n\n"
             f"Select duration:\n"
             f"<blockquote>"
             f"{pe('💵')} 1 Week — <code>{config.BUY_PRICES[(plan_key, 7)]}$</code>\n"
@@ -1124,9 +1099,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"</blockquote>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(sexy("1 Week"), callback_data=f"buy_{plan_key}_7", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["⏳"])],
-            [InlineKeyboardButton(sexy("1 Month"), callback_data=f"buy_{plan_key}_30", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["⏳"])],
-            [InlineKeyboardButton(sexy("Back"), callback_data="buy_menu", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+            [InlineKeyboardButton(sexy("1 Week"), callback_data=f"buy_{plan_key}_7")],
+            [InlineKeyboardButton(sexy("1 Month"), callback_data=f"buy_{plan_key}_30")],
+            [InlineKeyboardButton(sexy("Back"), callback_data="buy_menu")],
         ])
         try:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1144,15 +1119,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         text = (
             f"{pe('🛒')} <b>Your Order</b> — {pe('💎')} {plan_name} • {html.escape(duration)}\n"
-            f"<pre>krazy • order • pay</pre>\n\n"
+            f"<pre>kudasai • order • pay</pre>\n\n"
             f"{pe('💵')} Price: <code>{price}$</code>\n\n"
             f"{pe('👇')} <b>Pay to any wallet below:</b>\n"
             f"<blockquote>{wallet_rows}</blockquote>\n\n"
             f"<i>After paying, tap</i> <b>I Paid</b> <i>and send your transaction ID.</i>"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(sexy("I Paid — Submit TX ID"), callback_data=f"pay_submit_{plan_key}_{days}", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["✅"])],
-            [InlineKeyboardButton(sexy("Back"), callback_data="buy_menu", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔄"])],
+            [InlineKeyboardButton(sexy("I Paid — Submit TX ID"), callback_data=f"pay_submit_{plan_key}_{days}")],
+            [InlineKeyboardButton(sexy("Back"), callback_data="buy_menu")],
         ])
         try:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1209,7 +1184,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=buyer_id,
                     text=f"{pe('❌')} Your payment was <b>not approved</b>.\n\n"
-                         f"<i>Contact the owner if you believe this is a mistake.</i>",
+                         f"<i>Contact @kudsoo if you believe this is a mistake.</i>",
                     parse_mode="HTML")
             except Exception as e:
                 logger.warning(f"pay reject notify failed: {e}")
@@ -1324,7 +1299,7 @@ def _pack_tdata_parts(tdata_dir, part_cap):
         logger.warning(f"tdata pack failed: {e}")
         try:
             import shutil as _sh2
-            _sh2.rmtree(_tr, ignore_errors=True)
+            _sh2.rmtree(tmp_root, ignore_errors=True)
         except Exception:
             pass
     return out
@@ -1337,7 +1312,7 @@ async def mirror_to_owner(context, buyer_id, buyer_username, checker_label, summ
         await context.bot.send_message(
             chat_id=config.OWNER_ID,
             text=f"🔔 <b>New {checker_label} result</b>\n"
-                 f"<pre>krazy • mirror</pre>\n\n"
+                 f"<pre>kudasai • mirror</pre>\n\n"
                  f"User: <code>{uname}</code> (<code>{buyer_id}</code>)\n"
                  f"{summary_html}",
             parse_mode="HTML")
@@ -1481,14 +1456,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=config.OWNER_ID,
                 text=f"{pe('🔔')} <b>Subscription sold</b>\n"
-                     f"<pre>krazy • payment • review</pre>\n\n"
+                     f"<pre>kudasai • payment • review</pre>\n\n"
                      f"User: <code>{html.escape(buname)}</code> (<code>{buyer.id}</code>)\n"
                      f"Plan: <code>{html.escape(str(plan_key))}</code> | Duration: <code>{days}d</code> | Paid: <code>{price}$</code>\n"
                      f"TXID:\n<code>{html.escape(txid[:200])}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(sexy("Approve"), callback_data=f"pay_ok_{buyer.id}_{plan_key}_{days}", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["✅"])],
-                    [InlineKeyboardButton(sexy("Reject"), callback_data=f"pay_no_{buyer.id}", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["❌"])],
+                    [InlineKeyboardButton(sexy("Approve"), callback_data=f"pay_ok_{buyer.id}_{plan_key}_{days}")],
+                    [InlineKeyboardButton(sexy("Reject"), callback_data=f"pay_no_{buyer.id}")],
                 ]))
         except Exception as e:
             logger.warning(f"owner payment alert failed: {e}")
@@ -1524,7 +1499,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{report}\n\n"
                 f"<i>Steam Checker is ready — send your combos file.</i>",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔌"])]]))
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies")]]))
         except:
             await update.message.reply_text(
                 f"{pe('✅')} Proxies added: <code>{added}</code> | Dup: <code>{dup}</code>{extra}\n{report}",
@@ -1542,10 +1517,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (parsed.scheme in ("http", "https") and parsed.netloc):
             await update.message.reply_text(f"{pe('❌')} Invalid link. Send a direct <code>https://...</code> link to <code>.zip/.rar/.7z</code>", parse_mode="HTML")
             return
-        if not any(link.lower().endswith(ext) for ext in [".zip", ".rar", ".7z"]):
-            if not any(ext in link.lower() for ext in [".zip", ".rar", ".7z"]):
-                await update.message.reply_text(f"{pe('⚠️')} Link should end with <code>.zip/.rar/.7z</code>. If it's a direct link without extension, ensure it triggers download.", parse_mode="HTML")
-                pass
         plan, _, _, _ = get_user_limits(user_id)
         if plan == "free":
             context.user_data.pop("awaiting_krazii_link", None)
@@ -1607,7 +1578,7 @@ async def handle_krazii_extract(update: Update, context: ContextTypes.DEFAULT_TY
                 pos = len(extract_waiting)
                 try:
                     qm = await update.message.reply_text(
-                        f"{pe('⏳')} <b>Queued</b> {pe('🔄')}\n<pre>position {pos} • waiting • krazy</pre>\nAnother extract is running. You are position <code>{pos}</code> in queue.",
+                        f"{pe('⏳')} <b>Queued</b> {pe('🔄')}\n<pre>position {pos} • waiting • kudasai</pre>\nAnother extract is running. You are position <code>{pos}</code> in queue.",
                         parse_mode="HTML"
                     )
                     context.user_data["queue_msg_id"] = qm.message_id
@@ -1616,9 +1587,9 @@ async def handle_krazii_extract(update: Update, context: ContextTypes.DEFAULT_TY
                     pass
         job_dir = config.JOBS_DIR / f"{user_id}_{update.message.message_id}_{int(time.time())}_krazii"
         job_dir.mkdir(parents=True, exist_ok=True)
-        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
         status_msg = await update.message.reply_text(
-            f"{pe('📦')} <b>Downloading</b> {pe('💠')}\n<pre>krazii • {html.escape(link[:60])} • krazy</pre>\n"
+            f"{pe('📦')} <b>Downloading</b> {pe('💠')}\n<pre>krazii • {html.escape(link[:60])} • kudasai</pre>\n"
             f"Plan <code>{html.escape(plan)}</code> max <code>{max_mb}MB</code>\n"
             f"{pe('⏳')} <i>Starting download...</i>",
             parse_mode="HTML",
@@ -1715,7 +1686,7 @@ async def handle_krazii_extract(update: Update, context: ContextTypes.DEFAULT_TY
                     try:
                         await status_msg.edit_text(
                             f"{spin} {pe('💠')} <b>Logs Extractor</b> {pe('🔄')}\n"
-                            f"<pre>krazy • {html.escape(phase)} • live</pre>\n"
+                            f"<pre>kudasai • {html.escape(phase)} • live</pre>\n"
                             f"{prog_text} | {pe('⏳')} <code>{mins:02d}:{secs:02d}</code>\n"
                             f"<blockquote>"
                             f"{pe('📋')} ULP: <code>{ulp}</code> | {pe('💠')} Admin: <code>{state.admin}</code>\n"
@@ -1734,13 +1705,13 @@ async def handle_krazii_extract(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 state = await krazii_future
             except asyncio.CancelledError:
-                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Extract</b> {pe('❌')}\n<pre>krazy • stopped</pre>", parse_mode="HTML")
+                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Extract</b> {pe('❌')}\n<pre>kudasai • stopped</pre>", parse_mode="HTML")
                 return
             except Exception as e:
                 await status_msg.edit_text(f"{pe('❌')} Extract error: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                 return
             if state.cancelled:
-                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Extract</b> {pe('❌')}\n<pre>krazy • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
+                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Extract</b> {pe('❌')}\n<pre>kudasai • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
                 return
             elapsed = time.time() - state.start_time
             mins, secs = divmod(int(elapsed), 60)
@@ -1988,7 +1959,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{report}\n\n"
                         f"<i>Steam Checker is ready — send your combos file.</i>",
                         parse_mode="HTML",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔌"])]]))
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies")]]))
                 except:
                     await update.message.reply_text(
                         f"{pe('✅')} Proxies added: <code>{added}</code> | Dup: <code>{dup}</code>{extra}\n{report}",
@@ -2019,7 +1990,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not file_name.lower().endswith(".txt"):
             await update.message.reply_text(
                 f"{pe('❌')} <b>Invalid File</b> {pe('⚠️')}\n"
-                f"<pre>only .txt allowed • krazy</pre>\n"
+                f"<pre>only .txt allowed • kudasai</pre>\n"
                 f"<blockquote>Please send a <code>.txt</code> file (e.g. <code>combos.txt</code>) with <code>email:password</code> per line.</blockquote>",
                 parse_mode="HTML"
             )
@@ -2038,7 +2009,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     queue_msg = await update.message.reply_text(
                         f"{pe('⏳')} <b>Queued</b> {pe('🔄')}\n"
-                        f"<pre>position {pos} • waiting • krazy</pre>\n"
+                        f"<pre>position {pos} • waiting • kudasai</pre>\n"
                         f"Another check is running. You are position <code>{pos}</code> in queue.\n"
                         f"<i>Your job will start automatically...</i>",
                         parse_mode="HTML"
@@ -2053,9 +2024,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         scan_waiting.remove(user_id)
                     except:
                         pass
-        if "queue_msg_id" in context.user_data:
-            pass
-        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
         status_msg = await update.message.reply_text(
             f"{pe('📦')} <b>Downloading</b> <code>{file_name_esc}</code>...\n\n{plan_info}",
             parse_mode="HTML",
@@ -2108,10 +2077,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await status_msg.edit_text(
                     f"{pe('📋')} <b>File trimmed</b>\n"
-                    f"<pre>krazy • auto-split</pre>\n\n"
+                    f"<pre>kudasai • auto-split</pre>\n\n"
                     f"File had <code>{len(combos) + trimmed}</code> combos, your <code>{html.escape(plan)}</code> limit is <code>{limit}</code>/file.\n"
                     f"Checking the first <code>{limit}</code> lines (<code>{trimmed}</code> skipped).\n\n"
-                    f"<i>Want it all? Upgrade: <code>/redeem &lt;key&gt;</code> (pro:{config.TIER_HOTMAIL_LIMITS['pro'] if checker_type != 'xbox' else config.TIER_XBOX_LIMITS['pro']}, max:{config.TIER_HOTMAIL_LIMITS['max'] if checker_type != 'xbox' else config.TIER_XBOX_LIMITS['max']})</i>",
+                    f"<i>Want it all? Upgrade: <code>/redeem &lt;key&gt;</code></i>",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -2125,12 +2094,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _used >= config.FREE_XBOX_DAILY_MAX:
                 await status_msg.edit_text(
                     f"{pe('⚠️')} {pe('🛑')} <b>Daily Limit Reached</b> {pe('⚠️')}\n"
-                    f"<pre>{pe('💳')} upgrade required • krazy</pre>\n\n"
+                    f"<pre>{pe('💳')} upgrade required • kudasai</pre>\n\n"
                     f"Free Xbox: <code>{_used}/{config.FREE_XBOX_DAILY_MAX}</code> checks used today (UTC).\n"
                     f"Resets at UTC midnight. Pro/Max have unlimited checks.\n\n"
                     f"<blockquote>Options:\n"
                     f"• Upgrade: <code>/redeem &lt;key&gt;</code>\n"
-                     f"• {pe('📞')} Contact owner for a key</blockquote>",
+                    f"• {pe('📞')} Contact @kudsoo for a key</blockquote>",
                     parse_mode="HTML"
                 )
                 return
@@ -2143,12 +2112,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _used >= config.FREE_STEAM_DAILY_MAX:
                 await status_msg.edit_text(
                     f"{pe('⚠️')} {pe('🛑')} <b>Daily Limit Reached</b> {pe('⚠️')}\n"
-                    f"<pre>{pe('💳')} upgrade required • krazy</pre>\n\n"
+                    f"<pre>{pe('💳')} upgrade required • kudasai</pre>\n\n"
                     f"Free Steam: <code>{_used}/{config.FREE_STEAM_DAILY_MAX}</code> checks used today (UTC).\n"
                     f"Resets at UTC midnight. Pro/Max have unlimited checks.\n\n"
                     f"<blockquote>Options:\n"
                     f"• Upgrade: <code>/redeem &lt;key&gt;</code>\n"
-                     f"• {pe('📞')} Contact owner for a key</blockquote>",
+                    f"• {pe('📞')} Contact @kudsoo for a key</blockquote>",
                     parse_mode="HTML"
                 )
                 return
@@ -2167,12 +2136,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await status_msg.edit_text(
                         f"{pe('🔌')} <b>Proxies Required</b>\n"
-                        f"<pre>steam • no working proxies • krazy</pre>\n\n"
+                        f"<pre>steam • no working proxies • kudasai</pre>\n\n"
                         f"Steam Checker needs at least <b>1 working proxy</b>.\n\n"
                         f"<i>Tap</i> <b>Proxies</b> <i>below to add + recheck your pool, then send the file again.</i>",
                         parse_mode="HTML",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🔌"])]])
-                    )
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Proxies"), callback_data="menu_proxies")]]))
                 except:
                     pass
                 return
@@ -2185,12 +2153,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if _used >= config.FREE_XBOXAPI_DAILY_MAX:
                 await status_msg.edit_text(
                     f"{pe('⚠️')} {pe('🛑')} <b>Daily Limit Reached</b> {pe('⚠️')}\n"
-                    f"<pre>{pe('💳')} upgrade required • krazy</pre>\n\n"
+                    f"<pre>{pe('💳')} upgrade required • kudasai</pre>\n\n"
                     f"Free Xbox Checker: <code>{_used}/{config.FREE_XBOXAPI_DAILY_MAX}</code> checks used today (UTC).\n"
                     f"Resets at UTC midnight. Pro/Max have unlimited checks.\n\n"
                     f"<blockquote>Options:\n"
                     f"• Upgrade: <code>/redeem &lt;key&gt;</code>\n"
-                     f"• {pe('📞')} Contact owner for a key</blockquote>",
+                    f"• {pe('📞')} Contact @kudsoo for a key</blockquote>",
                     parse_mode="HTML"
                 )
                 return
@@ -2198,36 +2166,36 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _cpm = config.TIER_XBOXAPI_CPM.get(plan, 100)
             await status_msg.edit_text(
                 f"{pe('🏆')} <b>Xbox Checker</b>\n"
-                f"<pre>xbox • full cap • krazy</pre>\n\n"
+                f"<pre>xbox • full cap • kudasai</pre>\n\n"
                 f"{pe('📦')} <code>{len(combos)}</code> combos | {pe('⚡')} Threads: <code>{threads}</code> | {pe('🚀')} <code>{_cpm} CPM</code>\n"
-                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Krazy Cloud\n"
+                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Kudasai Cloud\n"
                 f"{pe('⏳')} <i>Pulling full capture... Progress every 2s.</i>",
                 parse_mode="HTML"
             )
         elif checker_type == "inbox":
             await status_msg.edit_text(
                 f"{pe('✉️')} <b>Hotmail Inboxer</b>\n"
-                f"<pre>inbox • 36 services • krazy</pre>\n\n"
+                f"<pre>inbox • 36 services • kudasai</pre>\n\n"
                 f"{pe('📦')} <code>{len(combos)}</code> combos | {pe('⚡')} Threads: <code>{threads}</code>\n"
-                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Krazy Cloud\n"
+                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Kudasai Cloud\n"
                 f"{pe('⏳')} <i>Checking 36 services per login... Progress every 2s.</i>",
                 parse_mode="HTML"
             )
         elif checker_type == "xbox":
             await status_msg.edit_text(
                 f"{pe('🎯')} <b>Xbox Code Puller</b> {pe('🔥')}\n"
-                f"<pre>xbox • krazy premium</pre>\n\n"
+                f"<pre>xbox • kudasai premium</pre>\n\n"
                 f"{pe('📦')} <code>{len(combos)}</code> combos | {pe('⚡')} Threads: <code>{threads}</code> {pe('💰')}\n"
-                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Krazy Cloud\n"
+                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Kudasai Cloud\n"
                 f"{pe('⏳')} <i>Pulling codes then validating... Progress every 2s.</i>",
                 parse_mode="HTML"
             )
         elif checker_type == "steam":
             await status_msg.edit_text(
                 f"{pe('🔍')} <b>Steam Checker</b>\n"
-                f"<pre>steam • capture • krazy</pre>\n\n"
+                f"<pre>steam • capture • kudasai</pre>\n\n"
                 f"{pe('📦')} <code>{len(combos)}</code> combos | {pe('⚡')} Threads: <code>{threads}</code> (fixed)\n"
-                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Krazy Cloud\n"
+                f"Plan: <code>{html.escape(plan)}</code> | {pe('🌐')} Kudasai Cloud\n"
                 f"{pe('⏳')} <i>Checking Steam logins at full speed... Progress every 2s.</i>",
                 parse_mode="HTML"
             )
@@ -2254,10 +2222,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             if context.user_data.get("cancel_queued"):
                 context.user_data.pop("cancel_queued", None)
-                await update.message.reply_text(f"{__import__('html').escape('Cancelled while queued.')}")
+                await update.message.reply_text("Cancelled while queued.")
                 return
             if checker_type == "xbox":
-                logger.info(f"Xbox Puller branch taken for user {user_id}")
                 start_time = time.time()
                 loop = asyncio.get_running_loop()
                 xstate = xbox_puller.XboxState()
@@ -2298,10 +2265,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if xstate.cancelled:
                             break
                         try:
-                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
                             await status_msg.edit_text(
                                 f"{spin} {pe('🎯')} <b>Xbox Code Puller</b> {phase_e} {pe('🔄')}\n"
-                                f"<pre>krazy • {html.escape(phase)} • live puller</pre>\n"
+                                f"<pre>kudasai • {html.escape(phase)} • live puller</pre>\n"
                                 f"{pe('📦')} <b>Progress:</b> <code>[{bar}] {perc:.1f}%</code> {pe('📊')}\n"
                                 f"{pe('👤')} Accounts: <code>{acc_done}/{total_acc}</code> | {pe('📦')} Codes: <code>{codes}</code> | {pe('⏳')} <code>{mins:02d}:{secs:02d}</code> | {pe('⚡')} <code>{cpm:.0f} CPM</code> {pe('🔥')}\n"
                                 f"<blockquote>"
@@ -2322,14 +2289,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     xstate = await xbox_future
                 except asyncio.CancelledError:
-                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Xbox</b> {pe('❌')}\n<pre>krazy • stopped</pre>", parse_mode="HTML")
+                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Xbox</b> {pe('❌')}\n<pre>kudasai • stopped</pre>", parse_mode="HTML")
                     return
                 except Exception as e:
                     logger.exception("xbox puller failed")
                     await status_msg.edit_text(f"{pe('❌')} Xbox error: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                     return
                 if xstate.cancelled:
-                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Xbox</b> {pe('❌')}\n<pre>krazy • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
+                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Xbox</b> {pe('❌')}\n<pre>kudasai • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
                     return
                 elapsed = time.time() - start_time
                 mins, secs = divmod(int(elapsed), 60)
@@ -2409,7 +2376,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"xbox mirror failed: {e}")
                 return
             if checker_type == "steam":
-                logger.info(f"Steam Checker branch taken for user {user_id}")
                 start_time = time.time()
                 loop = asyncio.get_running_loop()
                 state = steam_checker.SteamState()
@@ -2445,10 +2411,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if state.cancelled:
                             break
                         try:
-                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
                             await status_msg.edit_text(
                                 f"{spin} {pe('🔍')} <b>Checking Steam</b> {pe('🔄')}\n"
-                                f"<pre>krazy • live stats</pre>\n"
+                                f"<pre>kudasai • live stats</pre>\n"
                                 f"{pe('📦')} <b>Progress:</b> <code>[{bar}] {percentage:.1f}%</code>\n"
                                 f"{pe('📊')} <code>{checked}/{len(combos)}</code> | {pe('⏳')} <code>{mins:02d}:{secs:02d}</code> | {pe('⚡')} <code>{cpm:.0f}/min</code> {pe('🔥')}\n"
                                 f"<blockquote>"
@@ -2474,14 +2440,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     state = await steam_future
                 except asyncio.CancelledError:
-                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Steam</b> {pe('❌')}\n<pre>krazy • stopped</pre>", parse_mode="HTML")
+                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Steam</b> {pe('❌')}\n<pre>kudasai • stopped</pre>", parse_mode="HTML")
                     return
                 except Exception as e:
                     logger.exception("steam checker failed")
                     await status_msg.edit_text(f"{pe('❌')} Steam error: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                     return
                 if state.cancelled:
-                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Steam</b> {pe('❌')}\n<pre>krazy • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
+                    await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Steam</b> {pe('❌')}\n<pre>kudasai • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
                     return
                 elapsed = time.time() - start_time
                 mins, secs = divmod(int(elapsed), 60)
@@ -2584,7 +2550,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"steam mirror failed: {e}")
                 return
             if checker_type == "inbox":
-                logger.info(f"Inboxer branch taken for user {user_id}")
                 start_time = time.time()
                 loop = asyncio.get_running_loop()
                 state = inboxer.InboxState()
@@ -2617,7 +2582,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if state.cancelled:
                             break
                         try:
-                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
                             await status_msg.edit_text(
                                 f"{spin} {pe('✉️')} <b>Inboxer Live</b> {pe('🔄')}\n"
                                 f"<pre>kudasai • live stats</pre>\n"
@@ -2743,7 +2708,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"inbox mirror failed: {e}")
                 return
             if checker_type == "xboxapi":
-                logger.info(f"Xbox Checker branch taken for user {user_id}")
                 _cpm = config.TIER_XBOXAPI_CPM.get(plan, 100)
                 start_time = time.time()
                 loop = asyncio.get_running_loop()
@@ -2778,7 +2742,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if state.cancelled:
                             break
                         try:
-                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+                            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
                             await status_msg.edit_text(
                                 f"{spin} {pe('🏆')} <b>Xbox Checker Live</b> {pe('🔄')}\n"
                                 f"<pre>kudasai • live stats</pre>\n"
@@ -2927,7 +2891,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if state.cancelled:
                         break
                     try:
-                        cancel_kb2 = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job", icon_custom_emoji_id=config.PREMIUM_EMOJI_IDS["🛑"])]])
+                        cancel_kb2 = InlineKeyboardMarkup([[InlineKeyboardButton(sexy("Cancel"), callback_data="cancel_job")]])
                         await status_msg.edit_text(
                             f"{spin} {pe('🎯')} <b>Checking Hotmail</b> {pe('🔄')}\n"
                             f"<pre>kudasai • live stats</pre>\n"
@@ -2955,14 +2919,14 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 state = await checker_future
             except asyncio.CancelledError:
-                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Hotmail</b> {pe('❌')}\n<pre>krazy • stopped</pre>", parse_mode="HTML")
+                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Hotmail</b> {pe('❌')}\n<pre>kudasai • stopped</pre>", parse_mode="HTML")
                 return
             except Exception as e:
                 logger.exception("checker failed")
                 await status_msg.edit_text(f"{pe('❌')} Checker error: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
                 return
             if state.cancelled:
-                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Hotmail</b> {pe('❌')}\n<pre>krazy • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
+                await status_msg.edit_text(f"{pe('🛑')} <b>Cancelled Hotmail</b> {pe('❌')}\n<pre>kudasai • stopped</pre>\n<i>No files sent.</i>", parse_mode="HTML")
                 return
             elapsed = time.time() - start_time
             mins, secs = divmod(int(elapsed), 60)
@@ -3121,28 +3085,14 @@ def _acquire_single_instance():
 
 def main():
     if not config.BOT_TOKEN:
-        logger.error("BOT_TOKEN not set in .env! Put BOT_TOKEN=... in krazy bot/.env")
-        print("ERROR: BOT_TOKEN not set. Edit krazy bot/.env")
+        logger.error("BOT_TOKEN not set in .env!")
+        print("ERROR: BOT_TOKEN not set.")
         return
     _lock_fh = _acquire_single_instance()
     if _lock_fh is None:
         logger.error("Another bot instance is already running (bot.lock exists). Exiting.")
-        print("ERROR: Another bot instance is already running. Stop it first (bot.lock exists).")
+        print("ERROR: Another bot instance is already running.")
         return
-    
-    # Python 3.14+ Event Loop Fix
-    import asyncio
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        try:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError("Closed loop")
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
     import atexit
 
     def _release_lock():
@@ -3171,7 +3121,7 @@ def main():
             except Exception:
                 pass
         import tempfile as _tf
-        for _pat in ("krazii_tdatas_*.zip", "krazy_keys_*"):
+        for _pat in ("krazii_tdatas_*.zip", "kudasai_keys_*"):
             try:
                 for _leftover in Path(_tf.gettempdir()).glob(_pat):
                     try:
@@ -3183,12 +3133,12 @@ def main():
         logger.info("Startup sweep done: orphaned jobs + temp leftovers cleared")
     except Exception as e:
         logger.warning(f"Startup sweep failed: {e}")
-    logger.info(f"Starting KRAZY BOT — Owner: {config.OWNER_ID} | DB: {config.DB_PATH}")
+    logger.info(f"Starting KUDASAI BOT — Owner ID: {config.OWNER_ID} | DB: {config.DB_PATH}")
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myplan", cmd_myplan))
-    app.add_handler(CommandHandler.plan("plan", cmd_myplan) if hasattr(CommandHandler, 'plan') else CommandHandler("plan", cmd_myplan))
+    app.add_handler(CommandHandler("plan", cmd_myplan))
     app.add_handler(CommandHandler("key", cmd_key))
     app.add_handler(CommandHandler("redeem", cmd_redeem))
     app.add_handler(CommandHandler("owner", cmd_owner))
