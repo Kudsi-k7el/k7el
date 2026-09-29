@@ -55,8 +55,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            checks_count INTEGER DEFAULT 0,
-            is_authorized INTEGER DEFAULT 0
+            checks_count INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -71,15 +70,6 @@ def init_db():
             user_id INTEGER,
             account_id INTEGER,
             PRIMARY KEY (user_id, account_id)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_string TEXT UNIQUE,
-            is_authorized INTEGER DEFAULT 0,
-            redeemed_by INTEGER,
-            redeemed_at TEXT
         )
     """)
     conn.commit()
@@ -128,12 +118,6 @@ async def check_memberships(bot, user_id):
         pass
 
     return is_channel_joined, is_group_joined
-
-def is_user_authorized(user_id):
-    if user_id in ADMIN_IDS:
-        return True
-    user = db_query("SELECT is_authorized FROM users WHERE user_id=?", (user_id,), "one")
-    return bool(user and user["is_authorized"] == 1)
 
 # ==================== NETFLIX SCRAPER & ROBUST PARSER ====================
 
@@ -499,17 +483,9 @@ def get_join_menu():
         [InlineKeyboardButton("✅ Check Memberships", callback_data="check_membership")]
     ])
 
-def get_key_required_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 How to get a Key", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ I have a Key (Redeem)", callback_data="redeem_prompt")]
-    ])
-
 async def set_bot_commands(application):
     commands = [
         BotCommand("start", "Open main menu"),
-        BotCommand("redeem", "Redeem an access key"),
-        BotCommand("genkey", "Generate access keys (Admin only)"),
         BotCommand("nftoken", "Get a verified Netflix account token"),
         BotCommand("addacc", "Add Netflix account cookies (Admin only)"),
         BotCommand("stats", "Check total bot statistics"),
@@ -536,19 +512,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.edit_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
         return
 
-    # Check Key Authorization System
-    if not is_user_authorized(user.id):
-        key_text = (
-            "🔒 **Access Key Required!**\n\n"
-            "You must redeem a valid access key to unlock and view the bot menu.\n"
-            "Please send your key using the command: `/redeem <your_key>` or click below."
-        )
-        if update.message:
-            await update.message.reply_text(key_text, parse_mode="Markdown", reply_markup=get_key_required_menu())
-        elif update.callback_query:
-            await update.callback_query.message.edit_text(key_text, parse_mode="Markdown", reply_markup=get_key_required_menu())
-        return
-
     welcome_text = (
         "🎉 **Welcome to Kudasai Netflix Tokenizer Bot!** 🎉\n\n"
         "Convert Netscape cookies into instant auto-login tokens for **PC**, **Phone**, and **TV**.\n\n"
@@ -559,60 +522,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
     elif update.callback_query:
         await update.callback_query.message.edit_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_menu(user.id))
-
-# ==================== KEY SYSTEM COMMANDS ====================
-
-async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ This command is for admins only!")
-        return
-
-    args = context.args
-    count = 1
-    if args and args[0].isdigit():
-        count = int(args[0])
-
-    generated_keys = []
-    for _ in range(count):
-        random_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        key_str = f"KUDA-{random_str[:4]}-{random_str[4:8]}-{random_str[8:]}"
-        db_query("INSERT INTO keys (key_string) VALUES (?)", (key_str,))
-        generated_keys.append(key_str)
-
-    keys_text = "\n".join([f"<code>{k}</code>" for k in generated_keys])
-    await update.message.reply_text(
-        f"🔑 <b>Successfully Generated {count} Key(s):</b>\n\n{keys_text}",
-        parse_mode="HTML"
-    )
-
-async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username or "Unknown"))
-
-    if is_user_authorized(user.id):
-        await update.message.reply_text("ℹ️ You are already authorized and have access to the bot menu!")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("⚠️ Correct usage:\n`/redeem <KEY>`", parse_mode="Markdown")
-        return
-
-    key_input = args[0].strip().upper()
-    row = db_query("SELECT * FROM keys WHERE key_string=? AND is_authorized=0", (key_input,), "one")
-
-    if not row:
-        await update.message.reply_text("❌ **Invalid or already redeemed key!** Please check your key and try again.", parse_mode="Markdown")
-        return
-
-    # Authorize user and mark key as used
-    db_query("UPDATE users SET is_authorized = 1 WHERE user_id=?", (user.id,))
-    db_query("UPDATE keys SET is_authorized = 1, redeemed_by = ?, redeemed_at = ? WHERE key_string=?", 
-             (user.id, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), key_input))
-
-    await update.message.reply_text("✅ **Key successfully redeemed!** You now have full access to the bot.")
-    await start_command(update, context)
 
 # ==================== NEW COMMANDS: /addacc & /nftoken ====================
 
@@ -667,26 +576,21 @@ async def nftoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.reply_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
         return
 
-    if not is_user_authorized(user.id):
-        key_text = "🔒 **Access Key Required!** Please redeem an access key using `/redeem <key>`."
-        if update.callback_query:
-            await update.callback_query.message.reply_text(key_text, parse_mode="Markdown", reply_markup=get_key_required_menu())
-        else:
-            await update.message.reply_text(key_text, parse_mode="Markdown", reply_markup=get_key_required_menu())
-        return
-
+    # If triggered via callback, we send a new message or reply to message so it doesn't break
     if update.callback_query:
         status_msg = await update.callback_query.message.reply_text("⏳ <i>Pulling an account from stock and verifying...</i>", parse_mode="HTML")
     else:
         status_msg = await update.message.reply_text("⏳ <i>Pulling an account from stock and verifying...</i>", parse_mode="HTML")
 
     while True:
+        # First try to pick an account this user hasn't received yet
         row = db_query("""
             SELECT * FROM accounts 
             WHERE id NOT IN (SELECT account_id FROM user_claims WHERE user_id = ?) 
             ORDER BY RANDOM() LIMIT 1
         """, (user.id,), "one")
 
+        # If they have received all accounts, fallback to picking any random account from stock
         if not row:
             row = db_query("SELECT * FROM accounts ORDER BY RANDOM() LIMIT 1", fetch="one")
 
@@ -700,10 +604,12 @@ async def nftoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         acc = await asyncio.to_thread(check_account, cookies, 20)
         if not acc:
+            # If the account is dead, remove it completely from database and user claims, then loop again
             db_query("DELETE FROM accounts WHERE id=?", (acc_id,))
             db_query("DELETE FROM user_claims WHERE account_id=?", (acc_id,))
             continue
 
+        # Record that this user received this account so they get a different one next time
         db_query("INSERT OR IGNORE INTO user_claims (user_id, account_id) VALUES (?, ?)", (user.id, acc_id))
         break
 
@@ -777,19 +683,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(join_text, parse_mode="Markdown", reply_markup=get_join_menu())
         return
 
-    if data == "redeem_prompt":
-        await query.message.edit_text(
-            "🔑 **Redeem Access Key**\n\n"
-            "Please send your key using the command format:\n`/redeem <your_key>`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
-        return
-
-    if not is_user_authorized(user_id):
-        key_text = "🔒 **Access Key Required!** Please redeem an access key using `/redeem <key>`."
-        await query.message.edit_text(key_text, parse_mode="Markdown", reply_markup=get_key_required_menu())
-        return
-
     if data == "main_menu":
         await start_command(update, context)
     elif data == "check_prompt":
@@ -799,6 +692,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]))
     elif data == "get_nftoken":
+        # Fixed callback routing to safely call nftoken_command
         await nftoken_command(update, context)
     elif data == "check_status":
         user_data = db_query("SELECT checks_count FROM users WHERE user_id=?", (user_id,), "one")
@@ -817,9 +711,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "guide":
         guide_msg = (
             "📖 **User Guide:**\n\n"
-            "1. Redeem a valid key using `/redeem <key>` to unlock features.\n"
-            "2. Click **Get Account (/nftoken)** to instantly receive a verified active Netflix account.\n"
-            "3. Or click **Check Netflix Cookie** to check your own custom cookies.\n\n"
+            "1. Click **Get Account (/nftoken)** to instantly receive a verified active Netflix account.\n"
+            "2. Or click **Check Netflix Cookie** to check your own custom cookies.\n\n"
             f"➡️ Owner: {OWNER_HANDLE}"
         )
         await query.message.edit_text(guide_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]))
@@ -827,16 +720,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id not in ADMIN_IDS: return
         users_count = len(db_query("SELECT user_id FROM users", fetch="all"))
         stock_count = len(db_query("SELECT id FROM accounts", fetch="all"))
-        keys_count = len(db_query("SELECT id FROM keys WHERE is_authorized=0", fetch="all"))
         
         await query.message.edit_text(
             f"⚙️ **ADMIN CONTROL PANEL**\n\n"
             f"👥 Total Registered Users: `{users_count}`\n"
             f"📦 Accounts in Stock: `{stock_count}`\n"
-            f"🔑 Unused Keys in Stock: `{keys_count}`\n\n"
-            f"🛡️ Commands:\n"
-            f"• `/genkey [amount]` - Generate keys\n"
-            f"• `/addacc <cookies>` - Add accounts",
+            f"🛡️ Commands: Use `/addacc <cookies>` to add accounts.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]]))
 
@@ -855,16 +744,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Please join both our channel ({REQUIRED_CHANNEL}) and group ({REQUIRED_GROUP}) first before using the bot.",
             parse_mode="Markdown",
             reply_markup=get_join_menu()
-        )
-        return
-
-    if not is_user_authorized(user.id):
-        await update.message.reply_text(
-            "🔒 **Access Key Required!**\n\n"
-            "You cannot use the bot or check cookies until you redeem a valid key.\n"
-            "Use `/redeem <key>` to activate your access.",
-            parse_mode="Markdown",
-            reply_markup=get_key_required_menu()
         )
         return
 
@@ -938,8 +817,6 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(set_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("redeem", redeem_command))
-    app.add_handler(CommandHandler("genkey", genkey_command))
     app.add_handler(CommandHandler("nftoken", nftoken_command))
     app.add_handler(CommandHandler("addacc", add_acc_command))
     app.add_handler(CommandHandler("stats", lambda u, c: c.bot.send_message(u.effective_chat.id, f"📊 Total Bot Users: {len(db_query('SELECT user_id FROM users', fetch='all'))}")))
@@ -947,7 +824,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("[+] Kudasai Key-Protected Netflix Bot is online!")
+    print("[+] Kudasai Keyless Netflix Bot is online with working /nftoken button routing!")
     app.run_polling()
 
 if __name__ == "__main__":
